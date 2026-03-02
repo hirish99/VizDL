@@ -2,6 +2,10 @@
 
 Visual Deep Learning Research Tool — a ComfyUI-style web app for constructing, training, and ablating neural network architectures through a node graph UI.
 
+<img width="1789" height="960" alt="image" src="https://github.com/user-attachments/assets/d57d5597-b8d2-47a0-8aae-ba2a7ee0b183" />
+
+<img width="1195" height="837" alt="Screenshot from 2026-03-01 20-06-55" src="https://github.com/user-attachments/assets/78b3c023-1819-4933-83f4-60dfa60cf2b6" />
+
 ## Prerequisites
 
 - Python 3.10+
