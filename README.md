@@ -81,7 +81,7 @@ Then open **http://localhost:5173** on your local machine.
 
 ## How It Works
 
-VisDL splits the workflow between the **canvas** (left) and the **config panel** (right):
+VizDL splits the workflow between the **canvas** (left) and the **config panel** (right):
 
 ### Canvas (Architecture)
 
@@ -157,7 +157,7 @@ Steps 2-10 are handled automatically by the pipeline — you only configure them
 
 ### DAG Model Architecture
 
-VisDL uses a **DAG-based architecture system** for maximum flexibility. Instead of building models as a linear chain (`nn.Sequential`), layer nodes produce `ArchRef` objects — a lazy computation graph that can represent arbitrary DAG topologies:
+VizDL uses a **DAG-based architecture system** for maximum flexibility. Instead of building models as a linear chain (`nn.Sequential`), layer nodes produce `ArchRef` objects — a lazy computation graph that can represent arbitrary DAG topologies:
 
 1. **Layer nodes** (Linear, ReLU, etc.) produce `ArchRef` outputs connected via the `ARCH` data type
 2. **Structural nodes** (Split, Concat, DotProduct, Add) enable branching and merging
@@ -189,7 +189,7 @@ This enables skip connections, parallel branches, split/concat, and operator net
 
 ## CSV Data Format
 
-VisDL loads training data from CSV files. Upload a CSV via the config panel, then select input and target columns.
+VizDL loads training data from CSV files. Upload a CSV via the config panel, then select input and target columns.
 
 ### Column Selection
 

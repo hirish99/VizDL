@@ -1,4 +1,4 @@
-"""Entry point for the VisDL backend server."""
+"""Entry point for the VizDL backend server."""
 import uvicorn
 
 if __name__ == "__main__":

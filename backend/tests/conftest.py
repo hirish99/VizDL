@@ -1,4 +1,4 @@
-"""Shared test fixtures for VisDL backend tests."""
+"""Shared test fixtures for VizDL backend tests."""
 import csv
 import sys
 from pathlib import Path

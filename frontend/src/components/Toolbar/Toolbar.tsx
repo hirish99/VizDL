@@ -106,7 +106,7 @@ export function Toolbar() {
       fontFamily: 'system-ui, sans-serif',
     }}>
       <span style={{ color: '#6366f1', fontWeight: 700, fontSize: 14, marginRight: 16 }}>
-        VisDL
+        VizDL
       </span>
 
       <button onClick={handleExecute} disabled={isRunning} style={{

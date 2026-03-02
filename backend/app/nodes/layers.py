@@ -252,3 +252,84 @@ class LayerNormNode(BaseNode):
     def on_disable(self, **kwargs) -> tuple:
         upstream = kwargs.get("input")
         return (_make_arch(self._node_id, "Identity", {}, upstream),)
+
+
+@NodeRegistry.register("MLP")
+class MLPNode(BaseNode):
+    CATEGORY = "Layers"
+    DISPLAY_NAME = "MLP"
+    DESCRIPTION = "Multi-layer perceptron with configurable depth and width"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "input": InputSpec(
+                dtype=DataType.ARCH, required=False, is_handle=True,
+            ),
+            "in_features": InputSpec(
+                dtype=DataType.INT, default=None, required=False,
+                min_val=1, is_handle=False,
+            ),
+            "out_features": InputSpec(
+                dtype=DataType.INT, default=64, required=True,
+                min_val=1, is_handle=False,
+            ),
+            "hidden_size": InputSpec(
+                dtype=DataType.INT, default=128, required=True,
+                min_val=1, is_handle=False,
+            ),
+            "num_hidden_layers": InputSpec(
+                dtype=DataType.INT, default=2, required=True,
+                min_val=0, is_handle=False,
+            ),
+            "activation": InputSpec(
+                dtype=DataType.STRING, default="ReLU", required=False,
+                is_handle=False, choices=["ReLU", "GELU", "Tanh", "Sigmoid"],
+            ),
+        }
+
+    @classmethod
+    def RETURN_TYPES(cls):
+        return [OutputSpec(dtype=DataType.ARCH, name="output")]
+
+    def execute(self, **kwargs) -> tuple:
+        upstream = kwargs.get("input")
+        in_features = kwargs.get("in_features")
+        out_features = kwargs["out_features"]
+        hidden_size = kwargs["hidden_size"]
+        num_hidden = kwargs["num_hidden_layers"]
+        activation = kwargs.get("activation", "ReLU")
+        nid = self._node_id
+
+        if num_hidden == 0:
+            return (_make_arch(f"{nid}__out", "Linear", {
+                "in_features": in_features,
+                "out_features": out_features,
+            }, upstream),)
+
+        # Input projection → activation
+        ref = _make_arch(f"{nid}__h0_lin", "Linear", {
+            "in_features": in_features,
+            "out_features": hidden_size,
+        }, upstream)
+        ref = _make_arch(f"{nid}__h0_act", activation, {}, ref)
+
+        # Additional hidden layers
+        for i in range(1, num_hidden):
+            ref = _make_arch(f"{nid}__h{i}_lin", "Linear", {
+                "in_features": hidden_size,
+                "out_features": hidden_size,
+            }, ref)
+            ref = _make_arch(f"{nid}__h{i}_act", activation, {}, ref)
+
+        # Output projection (no activation)
+        ref = _make_arch(f"{nid}__out", "Linear", {
+            "in_features": hidden_size,
+            "out_features": out_features,
+        }, ref)
+
+        return (ref,)
+
+    def on_disable(self, **kwargs) -> tuple:
+        upstream = kwargs.get("input")
+        return (_make_arch(self._node_id, "Identity", {}, upstream),)
