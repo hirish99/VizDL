@@ -89,7 +89,8 @@ VizDL splits the workflow between the **canvas** (left) and the **config panel**
 
 The canvas is where you visually design your neural network architecture by dragging nodes from the palette and connecting them with edges. Only **layer nodes** and **structural nodes** belong on the canvas:
 
-- **Layer nodes**: Linear, ReLU, Sigmoid, Tanh, GELU, Dropout, BatchNorm1d, LayerNorm
+- **Layer nodes**: Linear, MLP, ReLU, Sigmoid, Tanh, GELU, Dropout, BatchNorm1d, LayerNorm
+- **Attention nodes**: SelfAttention, CrossAttention, PositionalEncoding, Tokenize, Squeeze (for transformer architectures)
 - **Structural nodes**: Split, Concat, DotProduct, Add (for branching/merging)
 
 Connect nodes by dragging from an output port to an input port. Each connection carries an `ARCH` data type — a lazy computation graph reference. The pipeline automatically compiles your canvas architecture into a trainable `nn.Module` when you execute.
@@ -100,8 +101,8 @@ The right-side config panel controls everything outside the architecture:
 
 | Section | Fields | Description |
 |---------|--------|-------------|
-| **Data** | CSV File, Input Columns, Target Columns, Val Split, Batch Size, Shuffle | Upload a CSV, select which columns are features vs targets, configure data splitting |
-| **Training** | Loss Function, Optimizer, Learning Rate, Epochs | Select loss (MSE/CrossEntropy/L1), optimizer (Adam/SGD/AdamW), set hyperparameters |
+| **Data** | CSV/.pt File, Input Columns, Target Columns, Val Split, Batch Size, Shuffle | Upload a CSV or .pt file, select which columns are features vs targets, configure data splitting. Auto batch size button finds the largest batch that fits in GPU memory. |
+| **Training** | Loss Function, Optimizer, Learning Rate, Epochs | Select loss (MSE/CrossEntropy/L1/Relative MSE), optimizer (Adam/SGD/AdamW), set hyperparameters |
 | **Test Data** | Test CSV, Test Input/Target Columns | (Optional, collapsible) Upload a separate test set for post-training evaluation |
 | **Export** | Model Name | Name for the exported model weights file |
 | **Node Properties** | (varies per node) | Click a node on the canvas to edit its parameters (e.g., `out_features` for Linear, `p` for Dropout). Each node also has a "Disabled (ablation)" checkbox. |
@@ -162,10 +163,11 @@ Steps 2-10 are handled automatically by the pipeline — you only configure them
 VizDL uses a **DAG-based architecture system** for maximum flexibility. Instead of building models as a linear chain (`nn.Sequential`), layer nodes produce `ArchRef` objects — a lazy computation graph that can represent arbitrary DAG topologies:
 
 1. **Layer nodes** (Linear, ReLU, etc.) produce `ArchRef` outputs connected via the `ARCH` data type
-2. **Structural nodes** (Split, Concat, DotProduct, Add) enable branching and merging
-3. **GraphModel** (called automatically by the pipeline) traces the `ArchRef` DAG backward from the terminal node and compiles it into a `GraphModule(nn.Module)` with a DAG-shaped forward pass
+2. **Attention nodes** (SelfAttention, CrossAttention, Tokenize, Squeeze) enable transformer-style architectures with 3D tensor support
+3. **Structural nodes** (Split, Concat, DotProduct, Add) enable branching and merging
+4. **GraphModel** (called automatically by the pipeline) traces the `ArchRef` DAG backward from the terminal node and compiles it into a `GraphModule(nn.Module)` with a DAG-shaped forward pass
 
-This enables skip connections, parallel branches, split/concat, and operator networks (like DeepONet) — all configured visually on the canvas.
+Shape inference tracks both 2D (flat) and 3D (sequence) tensors — Tokenize reshapes flat input into `(batch, n_tokens, embed_dim)`, attention nodes operate on the sequence dimension, and Squeeze reduces back to 2D. This enables skip connections, parallel branches, split/concat, operator networks (like DeepONet), and attention-based architectures — all configured visually on the canvas.
 
 ## Tech Stack
 
@@ -173,25 +175,26 @@ This enables skip connections, parallel branches, split/concat, and operator net
 - **Frontend**: React, TypeScript, React Flow, Zustand, Recharts, Vite
 - **Communication**: REST for CRUD, WebSocket for real-time training telemetry and system monitoring
 
-## Node Types (23)
+## Node Types (29)
 
 | Category | Nodes | Description |
 |----------|-------|-------------|
-| Layers | Linear, ReLU, Sigmoid, Tanh, GELU, Dropout, BatchNorm1d, LayerNorm | Neural network layer building blocks. Place on canvas, connect via ARCH ports. |
+| Layers | Linear, MLP, ReLU, Sigmoid, Tanh, GELU, Dropout, BatchNorm1d, LayerNorm | Neural network layer building blocks. Place on canvas, connect via ARCH ports. MLP expands to a multi-layer perceptron with configurable hidden sizes. |
+| Attention | SelfAttention, CrossAttention, PositionalEncoding, Tokenize, Squeeze | Transformer building blocks. Tokenize reshapes flat input into token sequences; attention ops work on 3D (batch, seq, embed) tensors; Squeeze reduces back to 2D. |
 | Structural | Split, Concat, DotProduct, Add | DAG topology operations for branching and merging. Split has multiple output ports; Concat, DotProduct, Add have two input ports. |
-| Data | CSV Loader, Data Splitter | Used internally by the pipeline. Configured via config panel, not placed on canvas. |
+| Data | CSV Loader, Data Splitter | Used internally by the pipeline. Configured via config panel, not placed on canvas. Supports both CSV and binary .pt files. |
 | Model | Graph Model, Model Export | Used internally by the pipeline. Graph Model compiles the canvas ArchRef DAG into nn.Module. |
-| Loss | MSE Loss, Cross Entropy Loss, L1 Loss | Used internally by the pipeline. Selected via config panel dropdown. |
+| Loss | MSE Loss, Cross Entropy Loss, L1 Loss, Relative MSE Loss | Used internally by the pipeline. Selected via config panel dropdown. Relative MSE is standard for operator learning. |
 | Optimizer | SGD, Adam, AdamW | Used internally by the pipeline. Selected via config panel dropdown. |
 | Training | Training Loop | Used internally by the pipeline. Epochs and learning rate set in config panel. |
 | Metrics | Metrics Collector, Evaluator | Used internally by the pipeline. Results shown in training dashboard. |
 
-**Canvas nodes** (what you drag and connect): Layers + Structural.
+**Canvas nodes** (what you drag and connect): Layers + Attention + Structural.
 **Pipeline nodes** (configured via config panel, run automatically): Data, Model, Loss, Optimizer, Training, Metrics.
 
-## CSV Data Format
+## Data Format
 
-VizDL loads training data from CSV files. Upload a CSV via the config panel, then select input and target columns.
+VizDL loads training data from CSV files or binary `.pt` files (PyTorch tensors). Upload via the config panel, then select input and target columns.
 
 ### Column Selection
 
@@ -215,6 +218,10 @@ The backend supports `fnmatch`-style glob patterns in column names. This is usef
 - All values must be numeric (float)
 - First row must be column headers
 - No index column (or exclude it from input/target selection)
+
+### .pt File Format
+
+Binary `.pt` files store a dict with `"header"` (list of column names) and `"data"` (2D float tensor). Faster to load than CSV for large datasets.
 
 ### Example: Simple Regression
 
@@ -329,6 +336,9 @@ class MyLayerNode(BaseNode):
 - **GPU-aware**: Model placed on CUDA if available; training loop moves batches to model's device.
 - **Ablation as first-class**: Every node has a disable toggle. Disabled layers become `nn.Identity` or vanish from the graph entirely.
 - **Glob column patterns**: CSV Loader supports `fnmatch` patterns (`feature_*`) for selecting columns in high-dimensional datasets without listing them individually.
+- **Binary .pt data support**: Upload PyTorch tensor files alongside CSV for large datasets.
+- **GPU auto batch size**: Binary search with real forward/backward passes to find the largest batch size that fits in GPU memory.
+- **Pipeline status indicator**: Real-time phase updates during pre-training steps (loading data, compiling model, creating optimizer).
 - **Pause/resume/stop training**: Thread-safe training controller with checkpoint save/restore.
 - **Large dataset support**: Streaming file upload (no memory limit), chunked CSV reading for files >100MB, zero-copy train/val splitting via `torch.utils.data.Subset`.
 - **Live system monitoring**: CPU, RAM, and VRAM usage streamed over WebSocket and displayed in the status bar.
@@ -372,9 +382,10 @@ backend/
     nodes/                        # All node implementations (auto-discovered)
       base.py                     # BaseNode, DataType (incl. ARCH), InputSpec, OutputSpec
       registry.py                 # NodeRegistry (decorator-based auto-registration)
-      layers.py                   # Linear, ReLU, Sigmoid, Tanh, GELU, Dropout, BatchNorm1d, LayerNorm
+      layers.py                   # Linear, MLP, ReLU, Sigmoid, Tanh, GELU, Dropout, BatchNorm1d, LayerNorm
+      attention.py                # SelfAttention, CrossAttention, PositionalEncoding, Tokenize, Squeeze
       structural.py               # Split, Concat, DotProduct, Add
-      data.py                     # CSVLoader (with glob patterns), DataSplitter
+      data.py                     # CSVLoader (CSV + .pt, glob patterns), DataSplitter
       model_assembly.py           # GraphModel, ModelExport
     models/schemas.py             # Pydantic schemas (GraphSchema, PipelineConfig, ExecuteRequest, etc.)
 frontend/
