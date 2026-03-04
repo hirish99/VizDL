@@ -109,3 +109,18 @@ class VramEstimateResponse(BaseModel):
     total_mb: float
     available_mb: float | None = None
     fits: bool | None = None
+
+
+class AutoBatchSizeRequest(BaseModel):
+    graph: GraphSchema
+    input_dim: int | None = None
+    optimizer: str = "Adam"
+    num_train_samples: int | None = None
+    file_id: str | None = None
+    input_columns: str | None = None
+
+
+class AutoBatchSizeResponse(BaseModel):
+    max_batch_size: int
+    steps_tried: int
+    search_log: list[dict]

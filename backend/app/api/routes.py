@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import torch
 from fastapi import APIRouter, HTTPException, UploadFile, File, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 
@@ -17,9 +18,9 @@ from ..engine.graph import Edge, Graph, NodeInstance
 from ..engine.pipeline import execute_pipeline
 from ..engine.validator import validate_graph
 from ..models.schemas import (
+    AutoBatchSizeRequest, AutoBatchSizeResponse,
     ExecuteRequest, ExecuteResponse, GraphSchema,
     SavedGraph, UploadResponse,
-    VramEstimateRequest, VramEstimateResponse,
 )
 from ..engine.session import create_session, get_session, remove_session
 from ..nodes.registry import NodeRegistry
@@ -96,7 +97,11 @@ async def execute(request: ExecuteRequest):
     session_id = request.session_id or str(uuid.uuid4())
     execution_id = str(uuid.uuid4())
     loop = asyncio.get_event_loop()
-    progress_cb = manager.make_progress_callback(session_id, loop)
+    _raw_cb = manager.make_progress_callback(session_id, loop)
+
+    def progress_cb(data: dict):
+        data["execution_id"] = execution_id
+        _raw_cb(data)
 
     session = create_session(execution_id, session_id)
     checkpoint_path = settings.weights_dir / "checkpoints" / f"{execution_id}.pt"
@@ -214,27 +219,12 @@ async def get_results(execution_id: str):
     return _results[execution_id]
 
 
-@router.post("/estimate-vram", response_model=VramEstimateResponse)
-async def estimate_vram(request: VramEstimateRequest):
-    """Estimate GPU VRAM usage for the given architecture + config.
-
-    Builds the model on CPU (no data needed) and calculates memory breakdown.
-    """
-    import torch
-
+def _build_model_from_graph(schema: GraphSchema, input_dim: int):
+    """Execute layer graph and compile into a GraphModule on CPU."""
     from ..engine.executor import topological_sort
     from ..engine.graph_module import trace_graph, infer_shapes_graph, GraphModule
 
-    layer_graph = _schema_to_graph(request.graph)
-    input_dim = request.input_dim
-    batch_size = request.batch_size
-    optimizer = request.optimizer
-
-    # Cap batch_size at dataset size (DataLoader never produces larger batches)
-    if request.num_train_samples is not None and request.num_train_samples > 0:
-        batch_size = min(batch_size, request.num_train_samples)
-
-    # 1. Execute layer graph to get ArchRef
+    layer_graph = _schema_to_graph(schema)
     order = topological_sort(layer_graph)
     layer_results: dict[str, tuple] = {}
     for node_id in order:
@@ -255,7 +245,6 @@ async def estimate_vram(request: VramEstimateRequest):
         else:
             layer_results[node_id] = node.execute(**kwargs)
 
-    # Find terminal node
     all_sources = {e.source_node for e in layer_graph.edges}
     terminal = None
     for nid in reversed(order):
@@ -266,82 +255,173 @@ async def estimate_vram(request: VramEstimateRequest):
         terminal = order[-1]
     arch_ref = layer_results[terminal][0]
 
-    # 2. Build model on CPU
     all_nodes = trace_graph([arch_ref])
     infer_shapes_graph(all_nodes, input_dim)
-    model = GraphModule(all_nodes, [arch_ref])
+    return GraphModule(all_nodes, [arch_ref]), all_nodes
 
-    # 3. Calculate memory
-    MB = 1024 * 1024
-    param_count = sum(p.numel() for p in model.parameters())
-    params_mb = round(param_count * 4 / MB, 2)
-    gradients_mb = params_mb
-    optimizer_mult = 2.0 if optimizer in ("Adam", "AdamW") else 1.0
-    optimizer_mb = round(params_mb * optimizer_mult, 2)
 
-    # Activations: dummy forward pass to measure actual tensor sizes per layer
-    activation_elements = []
-    hooks = []
-    for module in model.modules():
-        if len(list(module.children())) == 0:  # leaf modules only
-            def _hook(mod, inp, out, _sizes=activation_elements):
-                if isinstance(out, torch.Tensor):
-                    _sizes.append(out.numel())
-                elif isinstance(out, tuple):
-                    for t in out:
-                        if isinstance(t, torch.Tensor):
-                            _sizes.append(t.numel())
-            hooks.append(module.register_forward_hook(_hook))
+def _find_max_batch_size(
+    model: torch.nn.Module,
+    input_dim: int,
+    optimizer_name: str,
+    max_cap: int | None = None,
+) -> tuple[int, list[dict]]:
+    """Binary search for max batch size via actual GPU forward+backward."""
+    device = next(model.parameters()).device
+    log: list[dict] = []
+    opt_cls = {"Adam": torch.optim.Adam, "AdamW": torch.optim.AdamW,
+               "SGD": torch.optim.SGD}
 
-    dummy = torch.randn(batch_size, input_dim)
-    with torch.no_grad():
-        model(dummy)
-    for h in hooks:
-        h.remove()
+    def _try(bs: int) -> bool:
+        x = out = opt = None
+        try:
+            opt = opt_cls.get(optimizer_name, torch.optim.Adam)(model.parameters(), lr=1e-3)
+            x = torch.randn(bs, input_dim, device=device)
+            out = model(x)
+            out.sum().backward()
+            opt.step()
+            log.append({"batch_size": bs, "status": "ok"})
+            return True
+        except RuntimeError as e:
+            if "out of memory" not in str(e):
+                raise  # Re-raise non-OOM errors so we see the real problem
+            log.append({"batch_size": bs, "status": "oom"})
+            return False
+        finally:
+            del x, out, opt
+            model.zero_grad(set_to_none=True)
+            torch.cuda.synchronize()
+            gc.collect()
+            torch.cuda.empty_cache()
 
-    # fwd activations + backward saved tensors ≈ 2×
-    act_bytes = sum(activation_elements) * 4 * 2
-    activations_mb = round(act_bytes / MB, 2)
+    # Exponential growth: 2, 4, 8, ...
+    last_ok = 0
+    bs = 2
+    while True:
+        if max_cap and bs > max_cap:
+            bs = max_cap
+        if not _try(bs):
+            break
+        last_ok = bs
+        if max_cap and bs >= max_cap:
+            return bs, log
+        bs *= 2
 
-    # Batch data: input + target tensors
-    last_linear = [n for n in all_nodes if n.module_type == "Linear"]
-    output_dim = last_linear[-1].params.get("out_features", 1) if last_linear else 1
-    batch_data_mb = round(batch_size * (input_dim + output_dim) * 4 / MB, 2)
+    # Binary search between last_ok and first failure
+    lo, hi = last_ok, bs
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if _try(mid):
+            lo = mid
+        else:
+            hi = mid
 
-    total_mb = round(params_mb + gradients_mb + optimizer_mb + activations_mb + batch_data_mb, 2)
+    # 5% safety margin
+    safe = int(lo * 0.95)
+    return max(1, safe), log
 
-    # 4. Query available GPU VRAM
-    available_mb = None
-    fits = None
+
+@router.post("/auto-batch-size", response_model=AutoBatchSizeResponse)
+async def auto_batch_size(request: AutoBatchSizeRequest):
+    """Find max batch size via GPU binary search (forward+backward)."""
+    if not torch.cuda.is_available():
+        raise HTTPException(status_code=400, detail="No CUDA GPU available")
+
+    # Resolve input_dim from file if file_id + input_columns are provided
+    input_dim = request.input_dim
+    if request.file_id and request.input_columns:
+        from ..nodes.data import _resolve_columns
+        file_path = settings.upload_dir / request.file_id
+        if not file_path.exists():
+            raise HTTPException(status_code=400, detail=f"Data file not found: {request.file_id}")
+        if file_path.suffix == ".pt":
+            loaded = torch.load(file_path, map_location="cpu", weights_only=False)
+            available = loaded["header"]
+            del loaded
+        else:
+            import pandas as pd
+            available = list(pd.read_csv(file_path, nrows=0).columns)
+        specs = [s.strip() for s in request.input_columns.split(",") if s.strip()]
+        try:
+            resolved = _resolve_columns(specs, available)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        input_dim = len(resolved)
+
+    if input_dim is None or input_dim < 1:
+        raise HTTPException(status_code=400, detail="Could not determine input dimension — provide file_id + input_columns or input_dim")
+
+    model, _ = _build_model_from_graph(request.graph, input_dim)
+    model = model.to("cuda")
+    model.train()
+
+    max_cap = None
+    if request.num_train_samples and request.num_train_samples > 0:
+        max_cap = request.num_train_samples
+
+    loop = asyncio.get_event_loop()
     try:
-        import pynvml
-        pynvml.nvmlInit()
-        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-        mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-        available_mb = round(mem_info.total / MB, 0)
-        fits = total_mb <= available_mb
-    except Exception:
-        pass
+        max_bs, search_log = await loop.run_in_executor(
+            executor_pool,
+            lambda: _find_max_batch_size(model, input_dim, request.optimizer, max_cap),
+        )
+    finally:
+        del model
+        gc.collect()
+        torch.cuda.empty_cache()
 
-    return VramEstimateResponse(
-        param_count=param_count,
-        effective_batch_size=batch_size,
-        params_mb=params_mb,
-        gradients_mb=gradients_mb,
-        optimizer_mb=optimizer_mb,
-        activations_mb=activations_mb,
-        batch_data_mb=batch_data_mb,
-        total_mb=total_mb,
-        available_mb=available_mb,
-        fits=fits,
+    if max_bs <= 1:
+        raise HTTPException(status_code=400, detail="Model too large for even batch_size=2 on this GPU")
+
+    return AutoBatchSizeResponse(
+        max_batch_size=max_bs,
+        steps_tried=len(search_log),
+        search_log=search_log,
+    )
+
+
+@router.get("/upload/server-files")
+async def list_server_files():
+    """List data files already on the server's upload directory."""
+    files = []
+    for ext in ("*.csv", "*.pt"):
+        for p in sorted(settings.upload_dir.glob(ext)):
+            files.append({"file_id": p.name, "filename": p.name, "size_mb": round(p.stat().st_size / (1024 * 1024), 1)})
+    return files
+
+
+@router.post("/upload/server-files/{file_id}")
+async def use_server_file(file_id: str):
+    """Use a data file already on the server — returns columns and row count like upload does."""
+    dest = settings.upload_dir / file_id
+    if not dest.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    if dest.suffix == ".pt":
+        loaded = torch.load(dest, map_location="cpu", weights_only=False)
+        columns = loaded["header"]
+        rows = loaded["data"].shape[0]
+        del loaded
+    else:
+        columns = list(pd.read_csv(dest, nrows=0).columns)
+        rows = sum(len(chunk) for chunk in pd.read_csv(dest, usecols=[0], chunksize=100_000))
+
+    return UploadResponse(
+        file_id=file_id,
+        filename=file_id,
+        columns=columns,
+        rows=rows,
     )
 
 
 @router.post("/upload/csv", response_model=UploadResponse)
 async def upload_csv(file: UploadFile = File(...)):
-    """Upload a CSV file, return file_id and column info."""
-    if not file.filename or not file.filename.endswith(".csv"):
-        raise HTTPException(status_code=400, detail="Only CSV files are supported")
+    """Upload a CSV or .pt file, return file_id and column info."""
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No filename provided")
+    ext = Path(file.filename).suffix.lower()
+    if ext not in (".csv", ".pt"):
+        raise HTTPException(status_code=400, detail="Only .csv and .pt files are supported")
 
     file_id = f"{uuid.uuid4()}_{file.filename}"
     dest = settings.upload_dir / file_id
@@ -350,10 +430,15 @@ async def upload_csv(file: UploadFile = File(...)):
         while chunk := await file.read(8 * 1024 * 1024):  # 8MB chunks
             f.write(chunk)
 
-    # Read only header + count rows without loading full dataframe
-    columns = list(pd.read_csv(dest, nrows=0).columns)
-    # Count rows by iterating chunks (memory-efficient for large files)
-    rows = sum(len(chunk) for chunk in pd.read_csv(dest, usecols=[0], chunksize=100_000))
+    if ext == ".pt":
+        loaded = torch.load(dest, map_location="cpu", weights_only=False)
+        columns = loaded["header"]
+        rows = loaded["data"].shape[0]
+        del loaded
+    else:
+        columns = list(pd.read_csv(dest, nrows=0).columns)
+        rows = sum(len(chunk) for chunk in pd.read_csv(dest, usecols=[0], chunksize=100_000))
+
     return UploadResponse(
         file_id=file_id,
         filename=file.filename,

@@ -36,6 +36,22 @@ export async function uploadCSV(file: File): Promise<UploadResponse> {
   return data;
 }
 
+export interface ServerFile {
+  file_id: string;
+  filename: string;
+  size_mb: number;
+}
+
+export async function listServerFiles(): Promise<ServerFile[]> {
+  const { data } = await api.get('/upload/server-files');
+  return data;
+}
+
+export async function useServerFile(fileId: string): Promise<UploadResponse> {
+  const { data } = await api.post(`/upload/server-files/${fileId}`);
+  return data;
+}
+
 export async function saveGraph(
   graph: GraphSchema,
   config: PipelineConfig,
@@ -77,31 +93,24 @@ export async function stopTraining(executionId: string) {
   await api.post(`/execute/${executionId}/stop`);
 }
 
-export interface VramEstimate {
-  param_count: number;
-  effective_batch_size: number;
-  params_mb: number;
-  gradients_mb: number;
-  optimizer_mb: number;
-  activations_mb: number;
-  batch_data_mb: number;
-  total_mb: number;
-  available_mb: number | null;
-  fits: boolean | null;
+export interface AutoBatchSizeResult {
+  max_batch_size: number;
+  steps_tried: number;
+  search_log: { batch_size: number; status: 'ok' | 'oom' }[];
 }
 
-export async function estimateVram(
+export async function findMaxBatchSize(
   graph: GraphSchema,
-  inputDim: number,
-  batchSize: number,
   optimizer: string,
+  fileId: string,
+  inputColumns: string,
   numTrainSamples?: number | null,
-): Promise<VramEstimate> {
-  const { data } = await api.post('/estimate-vram', {
+): Promise<AutoBatchSizeResult> {
+  const { data } = await api.post('/auto-batch-size', {
     graph,
-    input_dim: inputDim,
-    batch_size: batchSize,
     optimizer,
+    file_id: fileId,
+    input_columns: inputColumns,
     num_train_samples: numTrainSamples ?? undefined,
   });
   return data;

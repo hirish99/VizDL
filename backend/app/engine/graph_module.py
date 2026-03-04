@@ -6,6 +6,7 @@ through the graph topology.
 """
 from __future__ import annotations
 
+import math
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -87,6 +88,17 @@ def _topo_sort(nodes: dict[str, ArchNode]) -> list[ArchNode]:
 
 
 # ---------------------------------------------------------------------------
+# Shape helpers
+# ---------------------------------------------------------------------------
+
+def _shape_feat(shape):
+    """Extract the feature dimension from a shape (int or (seq, feat) tuple)."""
+    if isinstance(shape, tuple):
+        return shape[1]
+    return shape
+
+
+# ---------------------------------------------------------------------------
 # Shape inference
 # ---------------------------------------------------------------------------
 
@@ -94,6 +106,9 @@ def infer_shapes_graph(nodes: list[ArchNode], input_dim: int | None):
     """Propagate tensor shapes through the architecture DAG.
 
     Mutates node.params in-place to fill missing dimensions.
+
+    Shapes are tracked as either ``int`` (flat 2D tensor, last-dim size)
+    or ``(seq_len, embed_dim)`` tuple (3D tensor from Tokenize).
     """
     shapes: dict[str, tuple] = {}  # node_id → tuple of per-output shapes
 
@@ -110,22 +125,27 @@ def infer_shapes_graph(nodes: list[ArchNode], input_dim: int | None):
         mt = node.module_type
 
         if mt == "Linear":
-            if node.params.get("in_features") is None and in_shapes[0] is not None:
-                node.params["in_features"] = in_shapes[0]
-            out = node.params.get("out_features", in_shapes[0])
-            shapes[node.node_id] = (out,)
+            s = in_shapes[0]
+            feat = _shape_feat(s) if s is not None else None
+            if node.params.get("in_features") is None and feat is not None:
+                node.params["in_features"] = feat
+            out_feat = node.params.get("out_features", feat)
+            if isinstance(s, tuple):
+                shapes[node.node_id] = ((s[0], out_feat),)
+            else:
+                shapes[node.node_id] = (out_feat,)
 
         elif mt in ("ReLU", "GELU", "Sigmoid", "Tanh", "Identity", "Dropout"):
             shapes[node.node_id] = (in_shapes[0],)
 
         elif mt == "BatchNorm1d":
             if node.params.get("num_features") is None and in_shapes[0] is not None:
-                node.params["num_features"] = in_shapes[0]
+                node.params["num_features"] = _shape_feat(in_shapes[0])
             shapes[node.node_id] = (in_shapes[0],)
 
         elif mt == "LayerNorm":
             if node.params.get("normalized_shape") is None and in_shapes[0] is not None:
-                node.params["normalized_shape"] = in_shapes[0]
+                node.params["normalized_shape"] = _shape_feat(in_shapes[0])
             shapes[node.node_id] = (in_shapes[0],)
 
         elif mt == "Split":
@@ -142,9 +162,91 @@ def infer_shapes_graph(nodes: list[ArchNode], input_dim: int | None):
         elif mt == "Add":
             shapes[node.node_id] = (in_shapes[0],)
 
+        elif mt == "Tokenize":
+            n_tokens = node.params.get("n_tokens")
+            s = in_shapes[0]
+            if n_tokens and s is not None and isinstance(s, int):
+                shapes[node.node_id] = ((n_tokens, s // n_tokens),)
+            else:
+                shapes[node.node_id] = ((n_tokens, None),)
+
+        elif mt in ("SelfAttention", "CrossAttention"):
+            # First input (query for cross-attn) determines output shape
+            s = in_shapes[0]
+            feat = _shape_feat(s) if s is not None else None
+            if node.params.get("embed_dim") is None and feat is not None:
+                node.params["embed_dim"] = feat
+            shapes[node.node_id] = (in_shapes[0],)
+
+        elif mt == "PositionalEncoding":
+            s = in_shapes[0]
+            feat = _shape_feat(s) if s is not None else None
+            if node.params.get("embed_dim") is None and feat is not None:
+                node.params["embed_dim"] = feat
+            shapes[node.node_id] = (in_shapes[0],)
+
+        elif mt == "Squeeze":
+            s = in_shapes[0]
+            mode = node.params.get("mode", "first")
+            if isinstance(s, tuple):
+                seq, dim = s
+                if mode == "flatten":
+                    shapes[node.node_id] = (seq * dim if seq and dim else None,)
+                else:
+                    shapes[node.node_id] = (dim,)
+            else:
+                shapes[node.node_id] = (s,)
+
         else:
             # Unknown type — assume passthrough
             shapes[node.node_id] = (in_shapes[0],)
+
+
+# ---------------------------------------------------------------------------
+# Attention module classes (used by MODULE_BUILDERS)
+# ---------------------------------------------------------------------------
+
+class _SelfAttentionModule(nn.Module):
+    """Self-attention: Q=K=V=input."""
+    def __init__(self, embed_dim: int, num_heads: int, dropout: float = 0.0):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(
+            embed_dim, num_heads, dropout=dropout, batch_first=True,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out, _ = self.attn(x, x, x)
+        return out
+
+
+class _CrossAttentionModule(nn.Module):
+    """Cross-attention: Q=query, K=V=context."""
+    def __init__(self, embed_dim: int, num_heads: int, dropout: float = 0.0):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(
+            embed_dim, num_heads, dropout=dropout, batch_first=True,
+        )
+
+    def forward(self, query: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        out, _ = self.attn(query, context, context)
+        return out
+
+
+class _PositionalEncodingModule(nn.Module):
+    """Sinusoidal positional encoding added to token embeddings."""
+    def __init__(self, max_len: int, embed_dim: int):
+        super().__init__()
+        pe = torch.zeros(max_len, embed_dim)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, embed_dim, 2, dtype=torch.float) * -(math.log(10000.0) / embed_dim)
+        )
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term[:embed_dim // 2])
+        self.register_buffer("pe", pe.unsqueeze(0))  # (1, max_len, embed_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.pe[:, :x.shape[1], :]
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +263,9 @@ MODULE_BUILDERS: dict[str, Callable[[dict], nn.Module]] = {
     "BatchNorm1d": lambda p: nn.BatchNorm1d(p["num_features"]),
     "LayerNorm": lambda p: nn.LayerNorm(p["normalized_shape"]),
     "Identity": lambda p: nn.Identity(),
+    "SelfAttention": lambda p: _SelfAttentionModule(p["embed_dim"], p["num_heads"], p.get("dropout", 0.0)),
+    "CrossAttention": lambda p: _CrossAttentionModule(p["embed_dim"], p["num_heads"], p.get("dropout", 0.0)),
+    "PositionalEncoding": lambda p: _PositionalEncodingModule(p.get("max_len", 256), p["embed_dim"]),
 }
 
 
@@ -183,11 +288,28 @@ def _build_add_op(params: dict) -> Callable:
     return lambda a, b: a + b
 
 
+def _build_tokenize_op(params: dict) -> Callable:
+    n_tokens = params["n_tokens"]
+    return lambda x: x.view(x.shape[0], n_tokens, -1)
+
+
+def _build_squeeze_op(params: dict) -> Callable:
+    mode = params.get("mode", "first")
+    if mode == "mean":
+        return lambda x: x.mean(dim=1)
+    elif mode == "flatten":
+        return lambda x: x.flatten(1)
+    else:  # "first"
+        return lambda x: x[:, 0, :]
+
+
 OP_BUILDERS: dict[str, Callable[[dict], Callable]] = {
     "Split": _build_split_op,
     "Concat": _build_concat_op,
     "DotProduct": _build_dot_product_op,
     "Add": _build_add_op,
+    "Tokenize": _build_tokenize_op,
+    "Squeeze": _build_squeeze_op,
 }
 
 

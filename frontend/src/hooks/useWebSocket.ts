@@ -13,6 +13,7 @@ export function useWebSocket() {
   const setResults = useExecutionStore((s) => s.setResults);
   const setErrors = useExecutionStore((s) => s.setErrors);
   const clearProgress = useExecutionStore((s) => s.clearProgress);
+  const setPipelineStatus = useExecutionStore((s) => s.setPipelineStatus);
 
   const connect = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
@@ -26,8 +27,11 @@ export function useWebSocket() {
 
     ws.onmessage = (event) => {
       const data = JSON.parse(event.data);
-      if (data.type === 'training_progress') {
-        addProgress(data as TrainingProgress);
+      const eid = data.execution_id as string | undefined;
+      if (data.type === 'pipeline_status') {
+        setPipelineStatus(data.phase);
+      } else if (data.type === 'training_progress') {
+        addProgress(data as TrainingProgress, eid);
       } else if (data.type === 'execution_complete') {
         if (data.results) setResults(data.results);
         setRunning(false);
@@ -41,7 +45,7 @@ export function useWebSocket() {
       } else if (data.type === 'training_resumed') {
         setPaused(false);
       } else if (data.type === 'training_stopped') {
-        clearProgress();
+        clearProgress(eid);
         setRunning(false);
         setExecutionId(null);
       }
@@ -53,7 +57,7 @@ export function useWebSocket() {
     };
 
     wsRef.current = ws;
-  }, [sessionId, addProgress, setRunning, setPaused, setExecutionId, setResults, setErrors, clearProgress]);
+  }, [sessionId, addProgress, setRunning, setPaused, setExecutionId, setResults, setErrors, clearProgress, setPipelineStatus]);
 
   useEffect(() => {
     connect();

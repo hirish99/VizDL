@@ -37,6 +37,9 @@ def _save_training_log(
     status = "stopped" if stopped else "completed"
 
     label = export_name or arch
+    # Truncate to avoid "File name too long" OS errors
+    if len(label) > 120:
+        label = label[:120]
     filename = f"{label}_{timestamp}_{status}.json"
 
     log = {
@@ -157,6 +160,8 @@ def execute_pipeline(
     arch_ref = layer_results[terminal][0]
 
     # --- 2. CSVLoader ---
+    if progress_callback:
+        progress_callback({"type": "pipeline_status", "phase": "Loading dataset..."})
     csv_node = NodeRegistry.get("CSVLoader")()
     dataset = csv_node.execute(
         file_id=config["file_id"],
@@ -168,6 +173,8 @@ def execute_pipeline(
         progress_callback({"type": "node_complete", "node_id": "_csv", "node_type": "CSVLoader"})
 
     # --- 3. DataSplitter ---
+    if progress_callback:
+        progress_callback({"type": "pipeline_status", "phase": "Splitting train/val..."})
     splitter_node = NodeRegistry.get("DataSplitter")()
     train_loader, val_loader = splitter_node.execute(
         dataset=dataset,
@@ -180,6 +187,8 @@ def execute_pipeline(
         progress_callback({"type": "node_complete", "node_id": "_split", "node_type": "DataSplitter"})
 
     # --- 4. GraphModel ---
+    if progress_callback:
+        progress_callback({"type": "pipeline_status", "phase": "Compiling model..."})
     graph_model_node = NodeRegistry.get("GraphModel")()
     graph_model_node._node_id = "_model"
     model = graph_model_node.execute(
@@ -190,7 +199,9 @@ def execute_pipeline(
     if progress_callback:
         progress_callback({"type": "node_complete", "node_id": "_model", "node_type": "GraphModel"})
 
-    # --- 5. Loss ---
+    # --- 5. Loss + 6. Optimizer ---
+    if progress_callback:
+        progress_callback({"type": "pipeline_status", "phase": "Creating optimizer..."})
     loss_type = config.get("loss_fn", "MSELoss")
     loss_node = NodeRegistry.get(loss_type)()
     loss_fn = loss_node.execute()[0]
@@ -207,6 +218,8 @@ def execute_pipeline(
         progress_callback({"type": "node_complete", "node_id": "_optim", "node_type": optim_type})
 
     # --- 7. TrainingLoop ---
+    if progress_callback:
+        progress_callback({"type": "pipeline_status", "phase": "Starting training..."})
     train_node = NodeRegistry.get("TrainingLoop")()
     training_result = train_node.execute(
         model=model,

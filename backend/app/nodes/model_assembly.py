@@ -58,6 +58,20 @@ class GraphModelNode(BaseNode):
                     f"LayerNorm node {node.node_id} is missing normalized_shape. "
                     f"Set it manually or place it after a Linear node."
                 )
+            if mt in ("SelfAttention", "CrossAttention") and not node.params.get("embed_dim"):
+                raise ValueError(
+                    f"{mt} node {node.node_id} is missing embed_dim. "
+                    f"Place it after a Linear node so shape inference can fill it."
+                )
+            if mt == "PositionalEncoding" and not node.params.get("embed_dim"):
+                raise ValueError(
+                    f"PositionalEncoding node {node.node_id} is missing embed_dim. "
+                    f"Place it after a Linear node so shape inference can fill it."
+                )
+            if mt == "Tokenize" and not node.params.get("n_tokens"):
+                raise ValueError(
+                    f"Tokenize node {node.node_id} is missing n_tokens."
+                )
 
         model = GraphModule(all_nodes, [arch_ref])
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

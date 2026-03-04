@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useConfigStore } from '../../store/configStore';
 import { useGraphStore, type NodeData } from '../../store/graphStore';
-import { uploadCSV, estimateVram, type VramEstimate } from '../../api/client';
+import { uploadCSV, findMaxBatchSize, listServerFiles, useServerFile, type ServerFile } from '../../api/client';
 import type { Node } from '@xyflow/react';
 
 export function ConfigPanel() {
@@ -38,9 +38,13 @@ function DataSection() {
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState('');
   const [filename, setFilename] = useState('');
-  const [vramEstimate, setVramEstimate] = useState<VramEstimate | null>(null);
-  const [vramLoading, setVramLoading] = useState(false);
-  const [vramError, setVramError] = useState('');
+  const [serverFiles, setServerFiles] = useState<ServerFile[]>([]);
+  const [autoSearching, setAutoSearching] = useState(false);
+  const [autoError, setAutoError] = useState('');
+
+  useEffect(() => {
+    listServerFiles().then(setServerFiles).catch(() => {});
+  }, []);
 
   const handleUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -51,7 +55,7 @@ function DataSection() {
       const res = await uploadCSV(file);
       config.setField('file_id', res.file_id);
       // Only clear columns if they weren't pre-set (e.g. from a loaded graph config).
-      // Glob patterns like "feature_*" are resolved by the backend.
+      // Glob patterns like "s_*_g" are resolved by the backend.
       if (!config.input_columns) config.setField('input_columns', '');
       if (!config.target_columns) config.setField('target_columns', '');
       config.setAvailableColumns(res.columns);
@@ -105,14 +109,46 @@ function DataSection() {
     <div style={sectionStyle}>
       <div style={sectionHeaderStyle}>Data</div>
       <div style={sectionBodyStyle}>
-        <label style={labelStyle}>CSV File</label>
+        <label style={labelStyle}>Data File</label>
         <input
           type="file"
-          accept=".csv"
+          accept=".csv,.pt"
           onChange={handleUpload}
           style={{ fontSize: 10, color: '#ccc', width: '100%', marginBottom: 4 }}
         />
-        {uploading && <div style={{ color: '#22c55e', fontSize: 10 }}>Uploading...</div>}
+        {serverFiles.length > 0 && (
+          <select
+            value=""
+            onChange={async (e) => {
+              const fid = e.target.value;
+              if (!fid) return;
+              setUploading(true);
+              setUploadError('');
+              try {
+                const res = await useServerFile(fid);
+                config.setField('file_id', res.file_id);
+                if (!config.input_columns) config.setField('input_columns', '');
+                if (!config.target_columns) config.setField('target_columns', '');
+                config.setAvailableColumns(res.columns);
+                config.setNumRows(res.rows);
+                setFilename(res.filename);
+              } catch (err: any) {
+                setUploadError(err?.response?.data?.detail || err?.message || 'Failed');
+              } finally {
+                setUploading(false);
+              }
+            }}
+            style={{ ...inputStyle, fontSize: 10, marginBottom: 4 }}
+          >
+            <option value="">Server files...</option>
+            {serverFiles.map((f) => (
+              <option key={f.file_id} value={f.file_id}>
+                {f.filename} ({f.size_mb} MB)
+              </option>
+            ))}
+          </select>
+        )}
+        {uploading && <div style={{ color: '#22c55e', fontSize: 10 }}>Loading...</div>}
         {uploadError && <div style={{ color: '#ef4444', fontSize: 10, marginBottom: 4 }}>{uploadError}</div>}
         {filename && <div style={{ color: '#808090', fontSize: 10, marginBottom: 4 }}>{filename}</div>}
 
@@ -184,6 +220,44 @@ function DataSection() {
               min={1} step={1} integer
               style={inputStyle}
             />
+            <button
+              onClick={async () => {
+                setAutoSearching(true);
+                setAutoError('');
+                try {
+                  const schema = toSchema();
+                  if (schema.nodes.length === 0) { setAutoError('No nodes'); return; }
+                  if (!config.file_id) { setAutoError('No data file loaded'); return; }
+                  if (!config.input_columns) { setAutoError('No input columns selected'); return; }
+                  const trainSamples = config.numRows != null
+                    ? Math.floor(config.numRows * (1 - config.val_ratio))
+                    : undefined;
+                  const result = await findMaxBatchSize(schema, optimizer, config.file_id, config.input_columns, trainSamples);
+                  config.setField('batch_size', result.max_batch_size);
+                } catch (err: any) {
+                  setAutoError(err?.response?.data?.detail || err.message || 'Search failed');
+                } finally {
+                  setAutoSearching(false);
+                }
+              }}
+              disabled={autoSearching}
+              style={{
+                width: '100%',
+                padding: '2px 6px',
+                background: '#1a1a2e',
+                border: '1px solid #f59e0b',
+                borderRadius: 3,
+                color: '#f59e0b',
+                fontSize: 9,
+                cursor: autoSearching ? 'wait' : 'pointer',
+                marginTop: 2,
+              }}
+            >
+              {autoSearching ? 'Searching GPU...' : 'Auto (GPU)'}
+            </button>
+            {autoError && (
+              <div style={{ color: '#ef4444', fontSize: 9, marginTop: 2 }}>{autoError}</div>
+            )}
           </div>
         </div>
 
@@ -196,97 +270,6 @@ function DataSection() {
           Shuffle
         </label>
 
-        <button
-          onClick={async () => {
-            setVramLoading(true);
-            setVramError('');
-            setVramEstimate(null);
-            try {
-              const schema = toSchema();
-              if (schema.nodes.length === 0) {
-                setVramError('No nodes on canvas');
-                return;
-              }
-              const inputDim = selectedInputs.size || 1;
-              // Train samples = total rows × (1 - val_ratio)
-              const trainSamples = config.numRows != null
-                ? Math.floor(config.numRows * (1 - config.val_ratio))
-                : undefined;
-              const est = await estimateVram(schema, inputDim, config.batch_size, optimizer, trainSamples);
-              setVramEstimate(est);
-            } catch (err: any) {
-              setVramError(err?.response?.data?.detail || err.message || 'Estimation failed');
-            } finally {
-              setVramLoading(false);
-            }
-          }}
-          disabled={vramLoading}
-          style={{
-            ...bulkBtnStyle,
-            width: '100%',
-            padding: '4px 8px',
-            marginTop: 6,
-            background: '#1a1a2e',
-            border: '1px solid #3b82f6',
-            color: '#3b82f6',
-          }}
-        >
-          {vramLoading ? 'Estimating...' : 'Check VRAM'}
-        </button>
-
-        {vramError && (
-          <div style={{ color: '#ef4444', fontSize: 9, marginTop: 3 }}>{vramError}</div>
-        )}
-
-        {vramEstimate && (
-          <div style={{
-            marginTop: 4,
-            padding: '6px 8px',
-            background: '#1a1a2e',
-            borderRadius: 4,
-            border: `1px solid ${
-              vramEstimate.fits === false ? '#ef4444'
-                : vramEstimate.available_mb && vramEstimate.total_mb > vramEstimate.available_mb * 0.5 ? '#f59e0b'
-                : '#22c55e'
-            }`,
-            fontSize: 10,
-          }}>
-            <div style={{
-              color: vramEstimate.fits === false ? '#ef4444' : '#22c55e',
-              fontWeight: 600,
-              marginBottom: 3,
-            }}>
-              ~{(vramEstimate.total_mb / 1024).toFixed(3)} GB
-              {vramEstimate.available_mb != null && (
-                <span style={{ color: '#808090', fontWeight: 400 }}>
-                  {' '}/ {(vramEstimate.available_mb / 1024).toFixed(0)} GB
-                </span>
-              )}
-            </div>
-            <div style={{ color: '#808090', lineHeight: 1.6 }}>
-              {vramEstimate.param_count.toLocaleString()} params
-              {vramEstimate.effective_batch_size !== config.batch_size && (
-                <>
-                  <br />
-                  <span style={{ color: '#f59e0b' }}>
-                    Effective batch: {vramEstimate.effective_batch_size.toLocaleString()}
-                    {' '}(capped at dataset)
-                  </span>
-                </>
-              )}
-              <br />
-              Weights: {(vramEstimate.params_mb / 1024).toFixed(4)} GB
-              <br />
-              Gradients: {(vramEstimate.gradients_mb / 1024).toFixed(4)} GB
-              <br />
-              Optimizer: {(vramEstimate.optimizer_mb / 1024).toFixed(4)} GB
-              <br />
-              Activations: {(vramEstimate.activations_mb / 1024).toFixed(4)} GB
-              <br />
-              Batch data: {(vramEstimate.batch_data_mb / 1024).toFixed(4)} GB
-            </div>
-          </div>
-        )}
       </div>
     </div>
   );
@@ -307,6 +290,7 @@ function TrainingSection() {
           style={inputStyle}
         >
           <option value="MSELoss">MSE Loss</option>
+          <option value="RelativeMSELoss">Relative MSE Loss</option>
           <option value="CrossEntropyLoss">Cross Entropy</option>
           <option value="L1Loss">L1 Loss (MAE)</option>
         </select>
@@ -422,10 +406,10 @@ function TestDataSection() {
       </div>
       {open && (
         <div style={sectionBodyStyle}>
-          <label style={labelStyle}>Test CSV</label>
+          <label style={labelStyle}>Test Data</label>
           <input
             type="file"
-            accept=".csv"
+            accept=".csv,.pt"
             onChange={handleUpload}
             style={{ fontSize: 10, color: '#ccc', width: '100%', marginBottom: 4 }}
           />

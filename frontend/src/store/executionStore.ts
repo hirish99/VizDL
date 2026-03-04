@@ -15,6 +15,7 @@ interface ExecutionState {
   sessionId: string;
   executionId: string | null;
   progress: TrainingProgress[];
+  pipelineStatus: string | null;
   results: Record<string, unknown>;
   errors: string[];
   ablationRuns: AblationRun[];
@@ -23,10 +24,11 @@ interface ExecutionState {
   setPaused: (paused: boolean) => void;
   setSessionId: (id: string) => void;
   setExecutionId: (id: string | null) => void;
-  addProgress: (p: TrainingProgress) => void;
+  addProgress: (p: TrainingProgress, executionId?: string) => void;
+  setPipelineStatus: (s: string | null) => void;
   setResults: (r: Record<string, unknown>) => void;
   setErrors: (e: string[]) => void;
-  clearProgress: () => void;
+  clearProgress: (executionId?: string) => void;
   addAblationRun: (run: AblationRun) => void;
   clearAblationRuns: () => void;
 }
@@ -37,21 +39,27 @@ export const useExecutionStore = create<ExecutionState>((set) => ({
   sessionId: `session_${Date.now()}`,
   executionId: null,
   progress: [],
+  pipelineStatus: null,
   results: {},
   errors: [],
   ablationRuns: [],
 
-  setRunning: (running) => set({ isRunning: running, ...(running ? {} : { isPaused: false }) }),
+  setRunning: (running) => set({ isRunning: running, ...(running ? {} : { isPaused: false, pipelineStatus: null }) }),
   setPaused: (paused) => set({ isPaused: paused }),
   setSessionId: (id) => set({ sessionId: id }),
   setExecutionId: (id) => set({ executionId: id }),
-  addProgress: (p) => set((s) => {
+  addProgress: (p, executionId) => set((s) => {
     if (!s.isRunning) return s;
-    return { progress: [...s.progress, p] };
+    if (executionId && s.executionId && executionId !== s.executionId) return s;
+    return { progress: [...s.progress, p], pipelineStatus: null };
   }),
+  setPipelineStatus: (s) => set({ pipelineStatus: s }),
   setResults: (r) => set({ results: r }),
   setErrors: (e) => set({ errors: e }),
-  clearProgress: () => set({ progress: [], errors: [], isPaused: false }),
+  clearProgress: (executionId) => set((s) => {
+    if (executionId && s.executionId && executionId !== s.executionId) return s;
+    return { progress: [], errors: [], isPaused: false };
+  }),
   addAblationRun: (run) => set((s) => ({ ablationRuns: [...s.ablationRuns, run] })),
   clearAblationRuns: () => set({ ablationRuns: [] }),
 }));

@@ -21,7 +21,7 @@ def _resolve_columns(specs: list[str], available: list[str]) -> list[str]:
 
     Each spec can be:
       - An exact column name: ``x1``
-      - A glob pattern: ``feature_*`` (matches via fnmatch)
+      - A glob pattern: ``s_*_g`` (matches via fnmatch)
 
     Returns resolved column names in the order specs appear,
     with glob matches sorted by their position in `available`.
@@ -50,8 +50,8 @@ def _resolve_columns(specs: list[str], available: list[str]) -> list[str]:
 @NodeRegistry.register("CSVLoader")
 class CSVLoaderNode(BaseNode):
     CATEGORY = "Data"
-    DISPLAY_NAME = "CSV Loader"
-    DESCRIPTION = "Load a CSV file and select input/target columns (supports glob patterns like feature_*)"
+    DISPLAY_NAME = "Data Loader"
+    DESCRIPTION = "Load a CSV or .pt file and select input/target columns (supports glob patterns like s_*_g)"
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -85,24 +85,40 @@ class CSVLoaderNode(BaseNode):
         if not raw_target:
             raise ValueError("No target columns specified")
 
-        # Read header to resolve glob patterns
-        header = list(pd.read_csv(file_path, nrows=0).columns)
-        input_cols = _resolve_columns(raw_input, header)
-        target_cols = _resolve_columns(raw_target, header)
+        if file_path.suffix == ".pt":
+            loaded = torch.load(file_path, map_location="cpu", weights_only=False)
+            header = loaded["header"]
+            data_tensor = loaded["data"]
 
-        file_size = file_path.stat().st_size
-        if file_size < _CHUNK_THRESHOLD_BYTES:
-            df = pd.read_csv(file_path)
-            X = torch.tensor(df[input_cols].values, dtype=torch.float32)
-            y = torch.tensor(df[target_cols].values, dtype=torch.float32)
+            input_cols = _resolve_columns(raw_input, header)
+            target_cols = _resolve_columns(raw_target, header)
+
+            col_idx = {name: i for i, name in enumerate(header)}
+            input_indices = [col_idx[c] for c in input_cols]
+            target_indices = [col_idx[c] for c in target_cols]
+
+            X = data_tensor[:, input_indices].float()
+            y = data_tensor[:, target_indices].float()
+            del loaded, data_tensor
         else:
-            chunks_X, chunks_y = [], []
-            for chunk in pd.read_csv(file_path, chunksize=50_000):
-                chunks_X.append(torch.tensor(chunk[input_cols].values, dtype=torch.float32))
-                chunks_y.append(torch.tensor(chunk[target_cols].values, dtype=torch.float32))
-            X = torch.cat(chunks_X)
-            y = torch.cat(chunks_y)
-            del chunks_X, chunks_y
+            # CSV path
+            header = list(pd.read_csv(file_path, nrows=0).columns)
+            input_cols = _resolve_columns(raw_input, header)
+            target_cols = _resolve_columns(raw_target, header)
+
+            file_size = file_path.stat().st_size
+            if file_size < _CHUNK_THRESHOLD_BYTES:
+                df = pd.read_csv(file_path)
+                X = torch.tensor(df[input_cols].values, dtype=torch.float32)
+                y = torch.tensor(df[target_cols].values, dtype=torch.float32)
+            else:
+                chunks_X, chunks_y = [], []
+                for chunk in pd.read_csv(file_path, chunksize=50_000):
+                    chunks_X.append(torch.tensor(chunk[input_cols].values, dtype=torch.float32))
+                    chunks_y.append(torch.tensor(chunk[target_cols].values, dtype=torch.float32))
+                X = torch.cat(chunks_X)
+                y = torch.cat(chunks_y)
+                del chunks_X, chunks_y
 
         return ({"X": X, "y": y, "columns": {"input": input_cols, "target": target_cols}},)
 

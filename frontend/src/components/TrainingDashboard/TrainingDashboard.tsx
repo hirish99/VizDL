@@ -1,14 +1,19 @@
+import { useState } from 'react';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid,
   Tooltip, Legend, ResponsiveContainer,
 } from 'recharts';
 import { useExecutionStore } from '../../store/executionStore';
+import { SaveTrainingDataButton } from './SaveTrainingData';
+import { LossCurveModal } from './LossCurveModal';
 
 export function TrainingDashboard() {
   const progress = useExecutionStore((s) => s.progress);
   const isRunning = useExecutionStore((s) => s.isRunning);
+  const pipelineStatus = useExecutionStore((s) => s.pipelineStatus);
   const errors = useExecutionStore((s) => s.errors);
   const ablationRuns = useExecutionStore((s) => s.ablationRuns);
+  const [detailsOpen, setDetailsOpen] = useState(false);
 
   const progressEvents = progress.filter((p) => p.type === 'training_progress');
   const latestProgress = progressEvents.length > 0 ? progressEvents[progressEvents.length - 1] : null;
@@ -54,7 +59,23 @@ export function TrainingDashboard() {
         display: 'flex', justifyContent: 'space-between', alignItems: 'center',
       }}>
         <span>Training Dashboard</span>
-        {isRunning && <span style={{ color: '#3b82f6', fontSize: 10 }}>Running...</span>}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          {chartData.length > 0 && (
+            <>
+              <SaveTrainingDataButton />
+              <button
+                onClick={() => setDetailsOpen(true)}
+                style={{
+                  background: '#1a1a2e', color: '#a0a0b0', border: '1px solid #2a2a3e',
+                  borderRadius: 4, padding: '3px 10px', fontSize: 10, cursor: 'pointer', fontWeight: 500,
+                }}
+              >
+                Details
+              </button>
+            </>
+          )}
+          {isRunning && <span style={{ color: '#3b82f6', fontSize: 10 }}>Running...</span>}
+        </div>
       </div>
 
       {errors.length > 0 && (
@@ -183,10 +204,21 @@ export function TrainingDashboard() {
       )}
 
       {chartData.length === 0 && comparisonData.length === 0 && (
-        <div style={{ color: '#444', fontSize: 11, textAlign: 'center', padding: 20 }}>
-          Execute a graph to see training progress
-        </div>
+        isRunning && pipelineStatus ? (
+          <div style={{ color: '#a0a0b0', fontSize: 12, textAlign: 'center', padding: 20 }}>
+            <span style={{ display: 'inline-block', animation: 'pulse 1.5s ease-in-out infinite' }}>
+              {pipelineStatus}
+            </span>
+            <style>{`@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }`}</style>
+          </div>
+        ) : (
+          <div style={{ color: '#444', fontSize: 11, textAlign: 'center', padding: 20 }}>
+            Execute a graph to see training progress
+          </div>
+        )
       )}
+
+      {detailsOpen && <LossCurveModal onClose={() => setDetailsOpen(false)} />}
     </div>
   );
 }

@@ -187,11 +187,12 @@ class TestInferShapesGraph:
 class TestBuilders:
     def test_all_module_builders_exist(self):
         expected = {"Linear", "ReLU", "GELU", "Sigmoid", "Tanh", "Dropout",
-                    "BatchNorm1d", "LayerNorm", "Identity"}
+                    "BatchNorm1d", "LayerNorm", "Identity",
+                    "SelfAttention", "CrossAttention", "PositionalEncoding"}
         assert expected == set(MODULE_BUILDERS.keys())
 
     def test_all_op_builders_exist(self):
-        expected = {"Split", "Concat", "DotProduct", "Add"}
+        expected = {"Split", "Concat", "DotProduct", "Add", "Tokenize", "Squeeze"}
         assert expected == set(OP_BUILDERS.keys())
 
 

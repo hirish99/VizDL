@@ -36,14 +36,15 @@ class SplitNode(BaseNode):
         ]
 
     def execute(self, **kwargs) -> tuple:
-        upstream = kwargs["input"]
+        upstream = kwargs.get("input")
         sizes = [int(s.strip()) for s in kwargs["split_sizes"].split(",")]
         dim = kwargs.get("dim", -1)
+        inputs = [upstream] if upstream else []
         node = ArchNode(
             node_id=self._node_id,
             module_type="Split",
             params={"split_sizes": sizes, "dim": dim},
-            inputs=[upstream],
+            inputs=inputs,
             n_outputs=2,
         )
         return (ArchRef(node, 0), ArchRef(node, 1))
@@ -75,19 +76,20 @@ class ConcatNode(BaseNode):
         return [OutputSpec(dtype=DataType.ARCH, name="output")]
 
     def execute(self, **kwargs) -> tuple:
-        a = kwargs["input_a"]
-        b = kwargs["input_b"]
+        a = kwargs.get("input_a")
+        b = kwargs.get("input_b")
         dim = kwargs.get("dim", -1)
+        inputs = [x for x in [a, b] if x is not None]
         node = ArchNode(
             node_id=self._node_id,
             module_type="Concat",
             params={"dim": dim},
-            inputs=[a, b],
+            inputs=inputs,
         )
         return (ArchRef(node, 0),)
 
     def on_disable(self, **kwargs) -> tuple:
-        return (kwargs["input_a"],)
+        return (kwargs.get("input_a"),)
 
 
 @NodeRegistry.register("DotProduct")
@@ -108,18 +110,19 @@ class DotProductNode(BaseNode):
         return [OutputSpec(dtype=DataType.ARCH, name="output")]
 
     def execute(self, **kwargs) -> tuple:
-        a = kwargs["input_a"]
-        b = kwargs["input_b"]
+        a = kwargs.get("input_a")
+        b = kwargs.get("input_b")
+        inputs = [x for x in [a, b] if x is not None]
         node = ArchNode(
             node_id=self._node_id,
             module_type="DotProduct",
             params={},
-            inputs=[a, b],
+            inputs=inputs,
         )
         return (ArchRef(node, 0),)
 
     def on_disable(self, **kwargs) -> tuple:
-        return (kwargs["input_a"],)
+        return (kwargs.get("input_a"),)
 
 
 @NodeRegistry.register("Add")
@@ -140,15 +143,16 @@ class AddNode(BaseNode):
         return [OutputSpec(dtype=DataType.ARCH, name="output")]
 
     def execute(self, **kwargs) -> tuple:
-        a = kwargs["input_a"]
-        b = kwargs["input_b"]
+        a = kwargs.get("input_a")
+        b = kwargs.get("input_b")
+        inputs = [x for x in [a, b] if x is not None]
         node = ArchNode(
             node_id=self._node_id,
             module_type="Add",
             params={},
-            inputs=[a, b],
+            inputs=inputs,
         )
         return (ArchRef(node, 0),)
 
     def on_disable(self, **kwargs) -> tuple:
-        return (kwargs["input_a"],)
+        return (kwargs.get("input_a"),)
