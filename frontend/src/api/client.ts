@@ -99,6 +99,24 @@ export interface AutoBatchSizeResult {
   search_log: { batch_size: number; status: 'ok' | 'oom' }[];
 }
 
+export interface SavedModel {
+  path: string;
+  name: string;
+  architecture: string;
+  parameter_count: number | null;
+  final_train_loss: number | null;
+  final_val_loss: number | null;
+  total_epochs: number;
+  timestamp: string;
+  graph: any | null;
+  config: Record<string, any> | null;
+}
+
+export async function listModels(): Promise<SavedModel[]> {
+  const { data } = await api.get('/models');
+  return data;
+}
+
 export async function findMaxBatchSize(
   graph: GraphSchema,
   optimizer: string,

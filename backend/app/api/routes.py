@@ -123,6 +123,7 @@ async def execute(request: ExecuteRequest):
             results = await loop.run_in_executor(executor_pool, run)
 
             serialized = _serialize_pipeline_results(results)
+            del results  # Drop reference so model/tensors can be GC'd
             # Evict oldest entries if at capacity
             while len(_results) >= _MAX_RESULTS:
                 _results.pop(next(iter(_results)))
@@ -369,6 +370,9 @@ async def auto_batch_size(request: AutoBatchSizeRequest):
         del model
         gc.collect()
         torch.cuda.empty_cache()
+        # Kill any orphaned child processes from OOM crashes
+        from ..engine.pipeline import _cleanup_gpu_children
+        _cleanup_gpu_children()
 
     if max_bs <= 1:
         raise HTTPException(status_code=400, detail="Model too large for even batch_size=2 on this GPU")
@@ -485,3 +489,31 @@ async def delete_graph(graph_id: str):
         raise HTTPException(status_code=404, detail="Graph not found")
     path.unlink()
     return {"status": "deleted"}
+
+
+@router.get("/models")
+async def list_models():
+    """List saved models available for continue-training."""
+    models = []
+    for report_path in sorted(settings.weights_dir.glob("*_report.json"), reverse=True):
+        weights_path = report_path.with_name(report_path.name.replace("_report.json", ".pt"))
+        if not weights_path.exists():
+            continue
+        try:
+            report = json.loads(report_path.read_text())
+            training = report.get("training", {})
+            models.append({
+                "path": str(weights_path),
+                "name": weights_path.stem,
+                "architecture": report.get("model", {}).get("architecture", "unknown"),
+                "parameter_count": report.get("model", {}).get("parameter_count"),
+                "final_train_loss": training.get("final_train_loss"),
+                "final_val_loss": training.get("final_val_loss"),
+                "total_epochs": training.get("total_epochs", len(training.get("epochs", training.get("epoch", [])))),
+                "timestamp": report.get("timestamp", ""),
+                "graph": report.get("graph"),
+                "config": report.get("pipeline_config"),
+            })
+        except Exception:
+            continue
+    return models

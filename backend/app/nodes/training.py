@@ -53,6 +53,7 @@ class TrainingLoopNode(BaseNode):
         train_loader = kwargs["train_loader"]
         val_loader = kwargs.get("val_loader")
         epochs = kwargs.get("epochs", 10)
+        epoch_offset: int = kwargs.get("epoch_offset", 0)
         progress_cb: Callable | None = kwargs.get("progress_callback")
         controller: TrainingController | None = kwargs.get("training_controller")
         checkpoint_path: Path | None = kwargs.get("checkpoint_path")
@@ -127,8 +128,8 @@ class TrainingLoopNode(BaseNode):
             if progress_cb:
                 progress_cb({
                     "type": "training_progress",
-                    "epoch": epoch + 1,
-                    "total_epochs": epochs,
+                    "epoch": epoch + 1 + epoch_offset,
+                    "total_epochs": epochs + epoch_offset,
                     "train_loss": avg_train_loss,
                     "val_loss": avg_val_loss,
                     "samples_trained": cumulative_samples,
@@ -156,6 +157,7 @@ class TrainingLoopNode(BaseNode):
 
         return ({
             "model": model,
+            "optimizer": optimizer,
             "history": history,
             "final_train_loss": history["train_loss"][-1] if history["train_loss"] else None,
             "final_val_loss": history["val_loss"][-1] if history["val_loss"] else None,

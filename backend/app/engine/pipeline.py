@@ -1,6 +1,8 @@
 """Pipeline executor: orchestrates the fixed training pipeline using layer graph + config."""
 import gc
 import json
+import os
+import signal
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -10,8 +12,35 @@ import torch
 from ..config import settings
 from ..nodes.registry import NodeRegistry
 from .executor import topological_sort
-from .graph import Graph
+from .graph import Edge, Graph, NodeInstance
 from .training_control import TrainingController
+
+
+def _graph_to_dict(graph: Graph) -> dict:
+    """Serialize a Graph to a JSON-safe dict (same shape as frontend GraphSchema)."""
+    return {
+        "nodes": [
+            {
+                "id": n.id,
+                "node_type": n.node_type,
+                "params": n.params,
+                "disabled": n.disabled,
+                "position": n.position,
+            }
+            for n in graph.nodes.values()
+        ],
+        "edges": [
+            {
+                "id": e.id,
+                "source_node": e.source_node,
+                "source_output": e.source_output,
+                "target_node": e.target_node,
+                "target_input": e.target_input,
+                "order": e.order,
+            }
+            for e in graph.edges
+        ],
+    }
 
 
 ProgressCallback = Callable[[dict[str, Any]], None]
@@ -74,6 +103,42 @@ def _save_training_log(
     return path
 
 
+def _cleanup_gpu_children():
+    """Kill orphaned child processes that may be holding GPU memory.
+
+    After a crash or stop, multiprocessing.spawn children can linger with
+    GPU allocations.  We find children of this process and terminate them.
+    """
+    my_pid = os.getpid()
+    try:
+        import psutil
+        parent = psutil.Process(my_pid)
+        for child in parent.children(recursive=True):
+            try:
+                child.kill()
+                child.wait(timeout=2)
+            except (psutil.NoSuchProcess, psutil.TimeoutExpired):
+                pass
+    except ImportError:
+        # psutil not available — try /proc on Linux
+        try:
+            for entry in os.listdir("/proc"):
+                if not entry.isdigit():
+                    continue
+                try:
+                    stat = Path(f"/proc/{entry}/stat").read_text()
+                    ppid = int(stat.split(")")[1].split()[1])
+                    if ppid == my_pid:
+                        os.kill(int(entry), signal.SIGKILL)
+                except (FileNotFoundError, PermissionError, ValueError, IndexError):
+                    pass
+        except FileNotFoundError:
+            pass
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def execute_pipeline(
     layer_graph: Graph,
     config: dict[str, Any],
@@ -94,196 +159,260 @@ def execute_pipeline(
     9. ModelExport → file_path
     10. (Optional) Evaluator on test data
     """
+    # Kill any orphaned child processes holding GPU memory from prior runs
+    _cleanup_gpu_children()
+
     results: dict[str, Any] = {}
+    # Pre-declare so finally can always clean up
+    model = None
+    optimizer = None
+    loss_fn = None
+    training_result = None
+    train_loader = None
+    val_loader = None
+    dataset = None
 
-    # --- 1. Execute layer graph to get layer_specs ---
-    order = topological_sort(layer_graph)
-    layer_results: dict[str, tuple] = {}
+    try:
+        # --- 1. Execute layer graph to get layer_specs ---
+        order = topological_sort(layer_graph)
+        layer_results: dict[str, tuple] = {}
 
-    for node_id in order:
-        node_inst = layer_graph.nodes[node_id]
-        node_cls = NodeRegistry.get(node_inst.node_type)
-        node = node_cls()
-        node._node_id = node_id
+        for node_id in order:
+            node_inst = layer_graph.nodes[node_id]
+            node_cls = NodeRegistry.get(node_inst.node_type)
+            node = node_cls()
+            node._node_id = node_id
 
-        kwargs: dict[str, Any] = {}
-        incoming = layer_graph.get_incoming_edges(node_id)
+            kwargs: dict[str, Any] = {}
+            incoming = layer_graph.get_incoming_edges(node_id)
 
-        input_groups: dict[str, list] = {}
-        for edge in incoming:
-            src_results = layer_results.get(edge.source_node)
-            if src_results is None:
-                continue
-            value = src_results[edge.source_output]
-            if edge.target_input not in input_groups:
-                input_groups[edge.target_input] = []
-            input_groups[edge.target_input].append((edge.order, value))
+            input_groups: dict[str, list] = {}
+            for edge in incoming:
+                src_results = layer_results.get(edge.source_node)
+                if src_results is None:
+                    continue
+                value = src_results[edge.source_output]
+                if edge.target_input not in input_groups:
+                    input_groups[edge.target_input] = []
+                input_groups[edge.target_input].append((edge.order, value))
 
-        for input_name, values in input_groups.items():
-            values.sort(key=lambda x: x[0])
-            if len(values) == 1:
-                kwargs[input_name] = values[0][1]
+            for input_name, values in input_groups.items():
+                values.sort(key=lambda x: x[0])
+                if len(values) == 1:
+                    kwargs[input_name] = values[0][1]
+                else:
+                    kwargs[input_name] = [v for _, v in values]
+
+            for k, v in node_inst.params.items():
+                if k not in kwargs:
+                    kwargs[k] = v
+
+            if node_inst.disabled:
+                outputs = node.on_disable(**kwargs)
             else:
-                kwargs[input_name] = [v for _, v in values]
+                outputs = node.execute(**kwargs)
 
-        for k, v in node_inst.params.items():
-            if k not in kwargs:
-                kwargs[k] = v
+            layer_results[node_id] = outputs
 
-        if node_inst.disabled:
-            outputs = node.on_disable(**kwargs)
-        else:
-            outputs = node.execute(**kwargs)
+            if progress_callback:
+                progress_callback({
+                    "type": "node_complete",
+                    "node_id": node_id,
+                    "node_type": node_inst.node_type,
+                })
 
-        layer_results[node_id] = outputs
+        # Find the final layer node (the one with no outgoing edges in the layer graph)
+        all_sources = {e.source_node for e in layer_graph.edges}
+        all_targets = {e.target_node for e in layer_graph.edges}
+        terminal_nodes = [nid for nid in order if nid not in all_sources or nid not in all_targets]
+        # The last node in topo order that has no outgoing edges
+        terminal = None
+        for nid in reversed(order):
+            if nid not in all_sources:
+                terminal = nid
+                break
+        if terminal is None:
+            terminal = order[-1]
+
+        arch_ref = layer_results[terminal][0]
+
+        # --- 2. CSVLoader ---
+        if progress_callback:
+            progress_callback({"type": "pipeline_status", "phase": "Loading dataset..."})
+        csv_node = NodeRegistry.get("CSVLoader")()
+        dataset = csv_node.execute(
+            file_id=config["file_id"],
+            input_columns=config["input_columns"],
+            target_columns=config["target_columns"],
+        )[0]
 
         if progress_callback:
-            progress_callback({
-                "type": "node_complete",
-                "node_id": node_id,
-                "node_type": node_inst.node_type,
-            })
+            progress_callback({"type": "node_complete", "node_id": "_csv", "node_type": "CSVLoader"})
 
-    # Find the final layer node (the one with no outgoing edges in the layer graph)
-    all_sources = {e.source_node for e in layer_graph.edges}
-    all_targets = {e.target_node for e in layer_graph.edges}
-    terminal_nodes = [nid for nid in order if nid not in all_sources or nid not in all_targets]
-    # The last node in topo order that has no outgoing edges
-    terminal = None
-    for nid in reversed(order):
-        if nid not in all_sources:
-            terminal = nid
-            break
-    if terminal is None:
-        terminal = order[-1]
+        # --- 3. DataSplitter ---
+        if progress_callback:
+            progress_callback({"type": "pipeline_status", "phase": "Splitting train/val..."})
+        splitter_node = NodeRegistry.get("DataSplitter")()
+        train_loader, val_loader = splitter_node.execute(
+            dataset=dataset,
+            val_ratio=config.get("val_ratio", 0.2),
+            batch_size=config.get("batch_size", 32),
+            shuffle=config.get("shuffle", True),
+        )
 
-    arch_ref = layer_results[terminal][0]
+        if progress_callback:
+            progress_callback({"type": "node_complete", "node_id": "_split", "node_type": "DataSplitter"})
 
-    # --- 2. CSVLoader ---
-    if progress_callback:
-        progress_callback({"type": "pipeline_status", "phase": "Loading dataset..."})
-    csv_node = NodeRegistry.get("CSVLoader")()
-    dataset = csv_node.execute(
-        file_id=config["file_id"],
-        input_columns=config["input_columns"],
-        target_columns=config["target_columns"],
-    )[0]
-
-    if progress_callback:
-        progress_callback({"type": "node_complete", "node_id": "_csv", "node_type": "CSVLoader"})
-
-    # --- 3. DataSplitter ---
-    if progress_callback:
-        progress_callback({"type": "pipeline_status", "phase": "Splitting train/val..."})
-    splitter_node = NodeRegistry.get("DataSplitter")()
-    train_loader, val_loader = splitter_node.execute(
-        dataset=dataset,
-        val_ratio=config.get("val_ratio", 0.2),
-        batch_size=config.get("batch_size", 32),
-        shuffle=config.get("shuffle", True),
-    )
-
-    if progress_callback:
-        progress_callback({"type": "node_complete", "node_id": "_split", "node_type": "DataSplitter"})
-
-    # --- 4. GraphModel ---
-    if progress_callback:
-        progress_callback({"type": "pipeline_status", "phase": "Compiling model..."})
-    graph_model_node = NodeRegistry.get("GraphModel")()
-    graph_model_node._node_id = "_model"
-    model = graph_model_node.execute(
-        architecture=arch_ref,
-        dataset=dataset,
-    )[0]
-
-    if progress_callback:
-        progress_callback({"type": "node_complete", "node_id": "_model", "node_type": "GraphModel"})
-
-    # --- 5. Loss + 6. Optimizer ---
-    if progress_callback:
-        progress_callback({"type": "pipeline_status", "phase": "Creating optimizer..."})
-    loss_type = config.get("loss_fn", "MSELoss")
-    loss_node = NodeRegistry.get(loss_type)()
-    loss_fn = loss_node.execute()[0]
-
-    # --- 6. Optimizer ---
-    optim_type = config.get("optimizer", "Adam")
-    optim_node = NodeRegistry.get(optim_type)()
-    optimizer = optim_node.execute(
-        model=model,
-        lr=config.get("lr", 0.001),
-    )[0]
-
-    if progress_callback:
-        progress_callback({"type": "node_complete", "node_id": "_optim", "node_type": optim_type})
-
-    # --- 7. TrainingLoop ---
-    if progress_callback:
-        progress_callback({"type": "pipeline_status", "phase": "Starting training..."})
-    train_node = NodeRegistry.get("TrainingLoop")()
-    training_result = train_node.execute(
-        model=model,
-        optimizer=optimizer,
-        loss_fn=loss_fn,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        epochs=config.get("epochs", 10),
-        progress_callback=progress_callback,
-        training_controller=training_controller,
-        checkpoint_path=checkpoint_path,
-    )[0]
-
-    results["training"] = {
-        "history": training_result["history"],
-        "final_train_loss": training_result.get("final_train_loss"),
-        "final_val_loss": training_result.get("final_val_loss"),
-        "stopped_early": training_result.get("stopped_early", False),
-    }
-
-    # --- 7b. Auto-save training log (always, even if later steps fail) ---
-    try:
-        log_path = _save_training_log(training_result["model"], training_result, config)
-        results["training_log_path"] = str(log_path)
-    except Exception:
-        pass  # best-effort — don't break pipeline on log write failure
-
-    # --- 8. MetricsCollector ---
-    metrics_node = NodeRegistry.get("MetricsCollector")()
-    metrics = metrics_node.execute(training_result=training_result)[0]
-    results["metrics"] = metrics
-
-    # --- 9. (Optional) Evaluator on test data ---
-    test_metrics = None
-    test_file_id = config.get("test_file_id")
-    if test_file_id:
-        test_csv_node = NodeRegistry.get("CSVLoader")()
-        test_dataset = test_csv_node.execute(
-            file_id=test_file_id,
-            input_columns=config.get("test_input_columns", config["input_columns"]),
-            target_columns=config.get("test_target_columns", config["target_columns"]),
+        # --- 4. GraphModel ---
+        if progress_callback:
+            progress_callback({"type": "pipeline_status", "phase": "Compiling model..."})
+        graph_model_node = NodeRegistry.get("GraphModel")()
+        graph_model_node._node_id = "_model"
+        model = graph_model_node.execute(
+            architecture=arch_ref,
+            dataset=dataset,
         )[0]
 
-        eval_node = NodeRegistry.get("Evaluator")()
-        test_metrics = eval_node.execute(
+        if progress_callback:
+            progress_callback({"type": "node_complete", "node_id": "_model", "node_type": "GraphModel"})
+
+        # --- 5. Loss + 6. Optimizer ---
+        if progress_callback:
+            progress_callback({"type": "pipeline_status", "phase": "Creating optimizer..."})
+        loss_type = config.get("loss_fn", "MSELoss")
+        loss_node = NodeRegistry.get(loss_type)()
+        loss_fn = loss_node.execute()[0]
+
+        # --- 6. Optimizer ---
+        optim_type = config.get("optimizer", "Adam")
+        optim_node = NodeRegistry.get(optim_type)()
+        optimizer = optim_node.execute(
+            model=model,
+            lr=config.get("lr", 0.001),
+        )[0]
+
+        if progress_callback:
+            progress_callback({"type": "node_complete", "node_id": "_optim", "node_type": optim_type})
+
+        # --- 6b. Resume from saved model (optional) ---
+        prior_history: dict[str, list] | None = None
+        resume_from = config.get("resume_from")
+        if resume_from:
+            if progress_callback:
+                progress_callback({"type": "pipeline_status", "phase": "Loading saved weights..."})
+            resume_path = Path(resume_from)
+            ckpt = torch.load(resume_path, weights_only=False, map_location="cpu")
+            model.load_state_dict(ckpt["model_state_dict"])
+            if "optimizer_state_dict" in ckpt:
+                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            # Load prior history from companion report JSON
+            report_path = resume_path.with_name(resume_path.stem + "_report.json")
+            if report_path.exists():
+                report = json.loads(report_path.read_text())
+                prior_history = report.get("training", {})
+            # Move model back to CUDA (load_state_dict was on CPU)
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            model.to(device)
+
+        # --- 7. TrainingLoop ---
+        if progress_callback:
+            progress_callback({"type": "pipeline_status", "phase": "Starting training..."})
+        epoch_offset = 0
+        if prior_history:
+            epoch_offset = len(prior_history.get("epochs", prior_history.get("epoch", [])))
+        train_node = NodeRegistry.get("TrainingLoop")()
+        training_result = train_node.execute(
+            model=model,
+            optimizer=optimizer,
+            loss_fn=loss_fn,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            epochs=config.get("epochs", 10),
+            epoch_offset=epoch_offset,
+            progress_callback=progress_callback,
+            training_controller=training_controller,
+            checkpoint_path=checkpoint_path,
+        )[0]
+
+        # Merge prior history if resuming
+        history = training_result["history"]
+        if prior_history:
+            prior_epochs = prior_history.get("epochs", prior_history.get("epoch", []))
+            offset = len(prior_epochs)
+            history["epoch"] = [e + offset for e in history["epoch"]]
+            history["train_loss"] = prior_history.get("train_loss", []) + history["train_loss"]
+            history["val_loss"] = prior_history.get("val_loss", []) + history["val_loss"]
+            history["epoch"] = prior_epochs + history["epoch"]
+            training_result["history"] = history
+
+        results["training"] = {
+            "history": history,
+            "final_train_loss": training_result.get("final_train_loss"),
+            "final_val_loss": training_result.get("final_val_loss"),
+            "stopped_early": training_result.get("stopped_early", False),
+            "resumed_from": resume_from,
+            "resume_epoch": len(prior_history.get("epochs", prior_history.get("epoch", []))) if prior_history else None,
+        }
+
+        # --- 7b. Auto-save training log (always, even if later steps fail) ---
+        try:
+            log_path = _save_training_log(training_result["model"], training_result, config)
+            results["training_log_path"] = str(log_path)
+        except Exception:
+            pass  # best-effort — don't break pipeline on log write failure
+
+        # --- 8. MetricsCollector ---
+        metrics_node = NodeRegistry.get("MetricsCollector")()
+        metrics = metrics_node.execute(training_result=training_result)[0]
+        results["metrics"] = metrics
+
+        # --- 9. (Optional) Evaluator on test data ---
+        test_metrics = None
+        test_file_id = config.get("test_file_id")
+        if test_file_id:
+            test_csv_node = NodeRegistry.get("CSVLoader")()
+            test_dataset = test_csv_node.execute(
+                file_id=test_file_id,
+                input_columns=config.get("test_input_columns", config["input_columns"]),
+                target_columns=config.get("test_target_columns", config["target_columns"]),
+            )[0]
+
+            eval_node = NodeRegistry.get("Evaluator")()
+            test_metrics = eval_node.execute(
+                training_result=training_result,
+                test_dataset=test_dataset,
+            )[0]
+            results["test_metrics"] = test_metrics
+
+        # --- 10. ModelExport ---
+        export_name = config.get("export_name", "")
+        export_node = NodeRegistry.get("ModelExport")()
+        file_path = export_node.execute(
             training_result=training_result,
-            test_dataset=test_dataset,
+            test_metrics=test_metrics,
+            name=export_name,
         )[0]
-        results["test_metrics"] = test_metrics
+        results["export_path"] = file_path
 
-    # --- 10. ModelExport ---
-    export_name = config.get("export_name", "")
-    export_node = NodeRegistry.get("ModelExport")()
-    file_path = export_node.execute(
-        training_result=training_result,
-        test_metrics=test_metrics,
-        name=export_name,
-    )[0]
-    results["export_path"] = file_path
+        # --- 10b. Append graph + config to the export report for continue-training ---
+        try:
+            report_path = Path(file_path).with_name(Path(file_path).stem + "_report.json")
+            if report_path.exists():
+                report = json.loads(report_path.read_text())
+                report["graph"] = _graph_to_dict(layer_graph)
+                # Save config without runtime-only fields
+                safe_config = {k: v for k, v in config.items()
+                               if k not in ("resume_from",)}
+                report["pipeline_config"] = safe_config
+                report_path.write_text(json.dumps(report, indent=2, default=str))
+        except Exception:
+            pass  # best-effort
 
-    # Cleanup: free GPU memory
-    del model, optimizer, loss_fn, train_loader, val_loader, dataset
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    return results
+        return results
+    finally:
+        # Cleanup: free GPU memory (runs even on exception)
+        del model, optimizer, loss_fn, training_result
+        del train_loader, val_loader, dataset
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()

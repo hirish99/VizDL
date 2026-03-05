@@ -273,6 +273,18 @@ During training:
 - Checkpoints saved to `data/weights/checkpoints/`
 - API endpoints: `POST /api/execute/{id}/pause`, `/resume`, `/stop`
 
+## Continue Training
+
+Resume training from a previously exported model. Select a saved model from the **Continue Training** dropdown in the left palette:
+
+- **Auto-loads architecture**: the saved graph is restored on the canvas
+- **Auto-loads config**: training parameters (loss, optimizer, LR, columns) are restored
+- **Warm-starts optimizer**: Adam momentum/variance state is preserved across sessions
+- **Loss curve continuity**: prior train/val history is prepended, epoch numbering continues seamlessly (e.g., epoch 51/100 after resuming a 50-epoch model)
+- **Data independence**: you must upload/select data separately — file references are never loaded from saved models
+
+Models without a saved graph (old exports) show a warning. Use the **Refresh** button to re-scan after new exports.
+
 ## Adding New Nodes
 
 Drop a decorated class in `backend/app/nodes/`:

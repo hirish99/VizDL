@@ -51,6 +51,8 @@ class PipelineConfig(BaseModel):
     test_file_id: str | None = None
     test_input_columns: str | None = None
     test_target_columns: str | None = None
+    # Continue training (optional) — path to a .pt file
+    resume_from: str | None = None
 
 
 class ExecuteRequest(BaseModel):

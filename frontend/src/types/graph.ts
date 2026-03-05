@@ -37,6 +37,7 @@ export interface PipelineConfig {
   test_file_id: string | null;
   test_input_columns: string | null;
   test_target_columns: string | null;
+  resume_from: string | null;
 }
 
 export interface ExecuteResponse {

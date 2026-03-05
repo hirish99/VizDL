@@ -64,12 +64,16 @@ class ModelExportNode(BaseNode):
 
         # --- Save weights (.pt) ---
         weights_path = settings.weights_dir / f"{base_name}.pt"
-        torch.save({
+        save_dict = {
             "model_state_dict": model.state_dict(),
             "architecture": arch,
             "model_structure": str(model),
             "saved_at": timestamp,
-        }, weights_path)
+        }
+        optimizer = result.get("optimizer")
+        if optimizer is not None:
+            save_dict["optimizer_state_dict"] = optimizer.state_dict()
+        torch.save(save_dict, weights_path)
 
         # --- Build comprehensive report ---
         history = result.get("history", {})

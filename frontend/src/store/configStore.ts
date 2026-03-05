@@ -32,6 +32,7 @@ const DEFAULT_CONFIG: PipelineConfig = {
   test_file_id: null,
   test_input_columns: null,
   test_target_columns: null,
+  resume_from: null,
 };
 
 export const useConfigStore = create<ConfigState>((set, get) => ({
@@ -63,16 +64,14 @@ export const useConfigStore = create<ConfigState>((set, get) => ({
       test_file_id: s.test_file_id,
       test_input_columns: s.test_input_columns,
       test_target_columns: s.test_target_columns,
+      resume_from: s.resume_from,
     };
   },
 
-  loadConfig: (config) => set((s) => {
-    // Preserve runtime state from current uploads — saved graphs have stale/empty file_ids
-    const { file_id, test_file_id, ...rest } = config;
-    const merged: Partial<ConfigState> = { ...rest };
-    if (file_id && !s.file_id) merged.file_id = file_id;
-    if (test_file_id !== undefined && !s.test_file_id) merged.test_file_id = test_file_id;
-    return merged;
+  loadConfig: (config) => set(() => {
+    // Strip runtime-only fields — file_ids are session-specific (user must upload/select data)
+    const { file_id: _fid, test_file_id: _tfid, resume_from: _resume, ...rest } = config;
+    return { ...rest };
   }),
 
   reset: () => set({ ...DEFAULT_CONFIG, availableColumns: [], testAvailableColumns: [], numRows: null }),
