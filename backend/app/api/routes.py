@@ -1,7 +1,8 @@
 """REST API routes."""
 import asyncio
-import gc
 import json
+import subprocess
+import sys
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -142,14 +143,6 @@ async def execute(request: ExecuteRequest):
             })
         finally:
             remove_session(execution_id)
-            # Free GPU memory even on exception
-            gc.collect()
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception:
-                pass
 
     asyncio.create_task(_run_training())
 
@@ -220,111 +213,13 @@ async def get_results(execution_id: str):
     return _results[execution_id]
 
 
-def _build_model_from_graph(schema: GraphSchema, input_dim: int):
-    """Execute layer graph and compile into a GraphModule on CPU."""
-    from ..engine.executor import topological_sort
-    from ..engine.graph_module import trace_graph, infer_shapes_graph, GraphModule
-
-    layer_graph = _schema_to_graph(schema)
-    order = topological_sort(layer_graph)
-    layer_results: dict[str, tuple] = {}
-    for node_id in order:
-        node_inst = layer_graph.nodes[node_id]
-        node_cls = NodeRegistry.get(node_inst.node_type)
-        node = node_cls()
-        node._node_id = node_id
-        kwargs: dict = {}
-        for edge in layer_graph.get_incoming_edges(node_id):
-            src = layer_results.get(edge.source_node)
-            if src is not None:
-                kwargs[edge.target_input] = src[edge.source_output]
-        for k, v in node_inst.params.items():
-            if k not in kwargs:
-                kwargs[k] = v
-        if node_inst.disabled:
-            layer_results[node_id] = node.on_disable(**kwargs)
-        else:
-            layer_results[node_id] = node.execute(**kwargs)
-
-    all_sources = {e.source_node for e in layer_graph.edges}
-    terminal = None
-    for nid in reversed(order):
-        if nid not in all_sources:
-            terminal = nid
-            break
-    if terminal is None:
-        terminal = order[-1]
-    arch_ref = layer_results[terminal][0]
-
-    all_nodes = trace_graph([arch_ref])
-    infer_shapes_graph(all_nodes, input_dim)
-    return GraphModule(all_nodes, [arch_ref]), all_nodes
-
-
-def _find_max_batch_size(
-    model: torch.nn.Module,
-    input_dim: int,
-    optimizer_name: str,
-    max_cap: int | None = None,
-) -> tuple[int, list[dict]]:
-    """Binary search for max batch size via actual GPU forward+backward."""
-    device = next(model.parameters()).device
-    log: list[dict] = []
-    opt_cls = {"Adam": torch.optim.Adam, "AdamW": torch.optim.AdamW,
-               "SGD": torch.optim.SGD}
-
-    def _try(bs: int) -> bool:
-        x = out = opt = None
-        try:
-            opt = opt_cls.get(optimizer_name, torch.optim.Adam)(model.parameters(), lr=1e-3)
-            x = torch.randn(bs, input_dim, device=device)
-            out = model(x)
-            out.sum().backward()
-            opt.step()
-            log.append({"batch_size": bs, "status": "ok"})
-            return True
-        except RuntimeError as e:
-            if "out of memory" not in str(e):
-                raise  # Re-raise non-OOM errors so we see the real problem
-            log.append({"batch_size": bs, "status": "oom"})
-            return False
-        finally:
-            del x, out, opt
-            model.zero_grad(set_to_none=True)
-            torch.cuda.synchronize()
-            gc.collect()
-            torch.cuda.empty_cache()
-
-    # Exponential growth: 2, 4, 8, ...
-    last_ok = 0
-    bs = 2
-    while True:
-        if max_cap and bs > max_cap:
-            bs = max_cap
-        if not _try(bs):
-            break
-        last_ok = bs
-        if max_cap and bs >= max_cap:
-            return bs, log
-        bs *= 2
-
-    # Binary search between last_ok and first failure
-    lo, hi = last_ok, bs
-    while hi - lo > 1:
-        mid = (lo + hi) // 2
-        if _try(mid):
-            lo = mid
-        else:
-            hi = mid
-
-    # 5% safety margin
-    safe = int(lo * 0.95)
-    return max(1, safe), log
-
-
 @router.post("/auto-batch-size", response_model=AutoBatchSizeResponse)
 async def auto_batch_size(request: AutoBatchSizeRequest):
-    """Find max batch size via GPU binary search (forward+backward)."""
+    """Find max batch size via GPU binary search (forward+backward).
+
+    Runs in a subprocess so all GPU memory is freed when the process exits,
+    preventing OOM leaks from corrupted autograd graphs.
+    """
     if not torch.cuda.is_available():
         raise HTTPException(status_code=400, detail="No CUDA GPU available")
 
@@ -352,27 +247,41 @@ async def auto_batch_size(request: AutoBatchSizeRequest):
     if input_dim is None or input_dim < 1:
         raise HTTPException(status_code=400, detail="Could not determine input dimension — provide file_id + input_columns or input_dim")
 
-    model, _ = _build_model_from_graph(request.graph, input_dim)
-    model = model.to("cuda")
-    model.train()
-
     max_cap = None
     if request.num_train_samples and request.num_train_samples > 0:
         max_cap = request.num_train_samples
 
-    loop = asyncio.get_event_loop()
-    try:
-        max_bs, search_log = await loop.run_in_executor(
-            executor_pool,
-            lambda: _find_max_batch_size(model, input_dim, request.optimizer, max_cap),
+    # Serialize config for subprocess
+    worker_config = {
+        "graph": request.graph.model_dump(),
+        "input_dim": input_dim,
+        "optimizer": request.optimizer,
+        "max_cap": max_cap,
+    }
+    config_json = json.dumps(worker_config)
+
+    def _run_in_subprocess():
+        proc = subprocess.run(
+            [sys.executable, "-m", "backend.app.api._auto_batch_worker"],
+            input=config_json,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            cwd=str(Path(__file__).resolve().parents[3]),  # project root
         )
-    finally:
-        del model
-        gc.collect()
-        torch.cuda.empty_cache()
-        # Kill any orphaned child processes from OOM crashes
-        from ..engine.pipeline import _cleanup_gpu_children
-        _cleanup_gpu_children()
+        if proc.returncode != 0:
+            stderr = proc.stderr.strip()
+            return {"error": f"Auto batch size search failed: {stderr or 'unknown error'}"}
+        return json.loads(proc.stdout)
+
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(executor_pool, _run_in_subprocess)
+
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+
+    max_bs = result["max_bs"]
+    search_log = result["log"]
 
     if max_bs <= 1:
         raise HTTPException(status_code=400, detail="Model too large for even batch_size=2 on this GPU")

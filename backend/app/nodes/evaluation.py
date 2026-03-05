@@ -51,15 +51,19 @@ class EvaluatorNode(BaseNode):
         # Per-sample predictions for inspection
         preds_list = predictions.cpu().squeeze().tolist()
         targets_list = y_test.cpu().squeeze().tolist()
+        n_samples = len(X_test)
         if not isinstance(preds_list, list):
             preds_list = [preds_list]
             targets_list = [targets_list]
+
+        # Free GPU tensors immediately
+        del X_test, y_test, predictions
 
         return ({
             "mse": mse,
             "mae": mae,
             "r2": r2,
-            "n_samples": len(X_test),
+            "n_samples": n_samples,
             "predictions": preds_list,
             "targets": targets_list,
         },)

@@ -1,8 +1,6 @@
 """Pipeline executor: orchestrates the fixed training pipeline using layer graph + config."""
 import gc
 import json
-import os
-import signal
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -103,42 +101,6 @@ def _save_training_log(
     return path
 
 
-def _cleanup_gpu_children():
-    """Kill orphaned child processes that may be holding GPU memory.
-
-    After a crash or stop, multiprocessing.spawn children can linger with
-    GPU allocations.  We find children of this process and terminate them.
-    """
-    my_pid = os.getpid()
-    try:
-        import psutil
-        parent = psutil.Process(my_pid)
-        for child in parent.children(recursive=True):
-            try:
-                child.kill()
-                child.wait(timeout=2)
-            except (psutil.NoSuchProcess, psutil.TimeoutExpired):
-                pass
-    except ImportError:
-        # psutil not available — try /proc on Linux
-        try:
-            for entry in os.listdir("/proc"):
-                if not entry.isdigit():
-                    continue
-                try:
-                    stat = Path(f"/proc/{entry}/stat").read_text()
-                    ppid = int(stat.split(")")[1].split()[1])
-                    if ppid == my_pid:
-                        os.kill(int(entry), signal.SIGKILL)
-                except (FileNotFoundError, PermissionError, ValueError, IndexError):
-                    pass
-        except FileNotFoundError:
-            pass
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-
 def execute_pipeline(
     layer_graph: Graph,
     config: dict[str, Any],
@@ -159,9 +121,6 @@ def execute_pipeline(
     9. ModelExport → file_path
     10. (Optional) Evaluator on test data
     """
-    # Kill any orphaned child processes holding GPU memory from prior runs
-    _cleanup_gpu_children()
-
     results: dict[str, Any] = {}
     # Pre-declare so finally can always clean up
     model = None
@@ -394,6 +353,11 @@ def execute_pipeline(
         )[0]
         results["export_path"] = file_path
 
+        # --- 10a. Drop heavy GPU references from training_result ---
+        # training_result holds live model + optimizer; drop them now that export is done
+        training_result.pop("model", None)
+        training_result.pop("optimizer", None)
+
         # --- 10b. Append graph + config to the export report for continue-training ---
         try:
             report_path = Path(file_path).with_name(Path(file_path).stem + "_report.json")
@@ -410,9 +374,17 @@ def execute_pipeline(
 
         return results
     finally:
-        # Cleanup: free GPU memory (runs even on exception)
+        if model is not None:
+            try:
+                model.cpu()
+            except Exception:
+                pass
         del model, optimizer, loss_fn, training_result
         del train_loader, val_loader, dataset
+        try:
+            del layer_results  # noqa: F821
+        except NameError:
+            pass
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
