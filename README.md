@@ -167,7 +167,7 @@ VizDL uses a **DAG-based architecture system** for maximum flexibility. Instead 
 3. **Structural nodes** (Split, Concat, DotProduct, Add) enable branching and merging
 4. **GraphModel** (called automatically by the pipeline) traces the `ArchRef` DAG backward from the terminal node and compiles it into a `GraphModule(nn.Module)` with a DAG-shaped forward pass
 
-Shape inference tracks both 2D (flat) and 3D (sequence) tensors — Tokenize reshapes flat input into `(batch, n_tokens, embed_dim)`, attention nodes operate on the sequence dimension, and Squeeze reduces back to 2D. This enables skip connections, parallel branches, split/concat, operator networks (like DeepONet), and attention-based architectures — all configured visually on the canvas.
+Shape inference tracks both 2D (flat) and 3D (sequence) tensors — Tokenize reshapes flat input into `(batch, n_tokens, embed_dim)`, attention nodes operate on the sequence dimension, and Squeeze reduces back to 2D. This enables skip connections, parallel branches, split/concat, operator networks, and attention-based architectures — all configured visually on the canvas.
 
 ## Tech Stack
 
@@ -250,7 +250,6 @@ Three pre-built graphs are included in `data/graphs/`:
 |-------|-------------|----------|
 | **Regression (3-layer)** | Linear(32) → ReLU → Linear(16) → ReLU → Linear(1) | Tabular regression |
 | **Classification (wide)** | Linear(64) → ReLU → Dropout(0.3) → Linear(32) → ReLU → Linear(1) → Sigmoid | Binary classification |
-| **DeepONet** | Split(64,2) → branch net (3×Linear+ReLU) + trunk net (3×Linear+ReLU) → DotProduct | Operator learning (PDE solving) |
 
 Load a saved graph from the **Load** dropdown in the toolbar. Saved graphs include both the canvas architecture and the config panel settings.
 
@@ -425,7 +424,7 @@ frontend/
       useNodeRegistry.ts          # Fetch node definitions from backend
       useSystemMonitor.ts         # System stats WebSocket
 data/
-  graphs/                         # Saved graph architectures (regression, classification, DeepONet)
+  graphs/                         # Saved graph architectures (regression, classification)
   uploads/                        # Uploaded CSV files
   weights/                        # Trained model weights + checkpoints
 ```
