@@ -1,5 +1,6 @@
 """Training loop node with progress callback and pause/resume/stop support."""
 import gc
+import json
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -40,6 +41,12 @@ class TrainingLoopNode(BaseNode):
             "checkpoint_path": InputSpec(
                 dtype=DataType.ANY, required=False, is_handle=False,
             ),
+            "live_log_path": InputSpec(
+                dtype=DataType.ANY, required=False, is_handle=False,
+            ),
+            "scheduler": InputSpec(
+                dtype=DataType.ANY, required=False, is_handle=False,
+            ),
         }
 
     @classmethod
@@ -57,6 +64,8 @@ class TrainingLoopNode(BaseNode):
         progress_cb: Callable | None = kwargs.get("progress_callback")
         controller: TrainingController | None = kwargs.get("training_controller")
         checkpoint_path: Path | None = kwargs.get("checkpoint_path")
+        live_log_path: Path | None = kwargs.get("live_log_path")
+        scheduler = kwargs.get("scheduler")
 
         # Use same device as model
         device = next(model.parameters()).device
@@ -121,6 +130,14 @@ class TrainingLoopNode(BaseNode):
 
             history["val_loss"].append(avg_val_loss)
 
+            # Step learning rate scheduler
+            if scheduler is not None:
+                if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    metric = avg_val_loss if avg_val_loss is not None else avg_train_loss
+                    scheduler.step(metric)
+                else:
+                    scheduler.step()
+
             cumulative_samples += total_train_samples
             elapsed = time.monotonic() - t_start
             throughput = cumulative_samples / elapsed if elapsed > 0 else 0
@@ -135,7 +152,23 @@ class TrainingLoopNode(BaseNode):
                     "samples_trained": cumulative_samples,
                     "total_samples": total_samples,
                     "throughput": round(throughput, 1),
+                    "lr": optimizer.param_groups[0]["lr"],
                 })
+
+            # Write live log so progress is visible without WS connection
+            if live_log_path:
+                try:
+                    live_log_path.write_text(json.dumps({
+                        "epoch": history["epoch"],
+                        "train_loss": history["train_loss"],
+                        "val_loss": history["val_loss"],
+                        "current_epoch": epoch + 1 + epoch_offset,
+                        "total_epochs": epochs + epoch_offset,
+                        "lr": optimizer.param_groups[0]["lr"],
+                        "throughput": round(throughput, 1),
+                    }, default=str))
+                except Exception:
+                    pass
 
             # Check if paused after epoch — save checkpoint so state is preserved
             if controller and controller.state == TrainingState.PAUSED:

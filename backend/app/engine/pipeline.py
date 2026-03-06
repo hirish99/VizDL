@@ -253,6 +253,18 @@ def execute_pipeline(
         if progress_callback:
             progress_callback({"type": "node_complete", "node_id": "_optim", "node_type": optim_type})
 
+        # --- 6a. Learning rate scheduler (optional) ---
+        scheduler = None
+        scheduler_name = config.get("scheduler", "None")
+        if scheduler_name == "CosineAnnealing":
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=config.get("epochs", 10),
+            )
+        elif scheduler_name == "ReduceOnPlateau":
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode="min", factor=0.5, patience=10,
+            )
+
         # --- 6b. Resume from saved model (optional) ---
         prior_history: dict[str, list] | None = None
         resume_from = config.get("resume_from")
@@ -280,6 +292,9 @@ def execute_pipeline(
         if prior_history:
             epoch_offset = len(prior_history.get("epochs", prior_history.get("epoch", [])))
         train_node = NodeRegistry.get("TrainingLoop")()
+        # Live log path for continuous progress tracking
+        live_log_path = settings.training_logs_dir / "live_progress.json"
+
         training_result = train_node.execute(
             model=model,
             optimizer=optimizer,
@@ -291,6 +306,8 @@ def execute_pipeline(
             progress_callback=progress_callback,
             training_controller=training_controller,
             checkpoint_path=checkpoint_path,
+            live_log_path=live_log_path,
+            scheduler=scheduler,
         )[0]
 
         # Merge prior history if resuming
