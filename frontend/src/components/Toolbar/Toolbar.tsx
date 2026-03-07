@@ -109,7 +109,7 @@ export function Toolbar() {
       fontFamily: 'system-ui, sans-serif',
     }}>
       <span style={{ color: '#6366f1', fontWeight: 700, fontSize: 14, marginRight: 16 }}>
-        VisDL
+        VizDL
       </span>
 
       <button onClick={handleExecute} disabled={isRunning} style={{
@@ -136,7 +136,34 @@ export function Toolbar() {
       )}
 
       <button onClick={() => setSaveDialogOpen(true)} style={btnStyle}>Save</button>
-      <button onClick={handleOpenLoad} style={btnStyle}>Load</button>
+      <div style={{ position: 'relative' }}>
+        <button onClick={handleOpenLoad} style={btnStyle}>Load</button>
+        {loadDialogOpen && (
+          <>
+            <div
+              style={{ position: 'fixed', inset: 0, zIndex: 999 }}
+              onClick={() => setLoadDialogOpen(false)}
+            />
+            <div style={dropdownStyle}>
+              {graphList.length === 0 ? (
+                <span style={{ color: '#555', fontSize: 11, padding: '8px 12px' }}>No saved graphs</span>
+              ) : (
+                graphList.map((g) => (
+                  <button
+                    key={g.id}
+                    onClick={() => handleLoad(g.id)}
+                    style={dropdownItemStyle}
+                    onMouseEnter={(e) => (e.currentTarget.style.background = '#2a2a3e')}
+                    onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
+                  >
+                    {g.name}
+                  </button>
+                ))
+              )}
+            </div>
+          </>
+        )}
+      </div>
       <button onClick={handleClear} style={{ ...btnStyle, background: '#2a2a3e' }}>Clear</button>
 
       {/* Save dialog */}
@@ -152,28 +179,6 @@ export function Toolbar() {
           />
           <button onClick={handleSave} style={btnStyle}>Save</button>
           <button onClick={() => setSaveDialogOpen(false)} style={{ ...btnStyle, background: '#2a2a3e' }}>
-            Cancel
-          </button>
-        </div>
-      )}
-
-      {/* Load dialog */}
-      {loadDialogOpen && (
-        <div style={dialogStyle}>
-          {graphList.length === 0 ? (
-            <span style={{ color: '#555', fontSize: 11 }}>No saved graphs</span>
-          ) : (
-            graphList.map((g) => (
-              <button
-                key={g.id}
-                onClick={() => handleLoad(g.id)}
-                style={{ ...btnStyle, background: '#1e1e2e' }}
-              >
-                {g.name}
-              </button>
-            ))
-          )}
-          <button onClick={() => setLoadDialogOpen(false)} style={{ ...btnStyle, background: '#2a2a3e' }}>
             Cancel
           </button>
         </div>
@@ -212,4 +217,33 @@ const inputStyle: React.CSSProperties = {
   padding: '4px 8px',
   fontSize: 11,
   outline: 'none',
+};
+
+const dropdownStyle: React.CSSProperties = {
+  position: 'absolute',
+  top: '100%',
+  left: 0,
+  zIndex: 1000,
+  background: '#1a1a2a',
+  border: '1px solid #2a2a3e',
+  borderRadius: 6,
+  padding: '4px 0',
+  display: 'flex',
+  flexDirection: 'column',
+  minWidth: 180,
+  maxHeight: 300,
+  overflowY: 'auto',
+  marginTop: 4,
+  boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
+};
+
+const dropdownItemStyle: React.CSSProperties = {
+  background: 'transparent',
+  color: '#c0c0d0',
+  border: 'none',
+  padding: '6px 12px',
+  fontSize: 11,
+  cursor: 'pointer',
+  textAlign: 'left',
+  fontWeight: 500,
 };

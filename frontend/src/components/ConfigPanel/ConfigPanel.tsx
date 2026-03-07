@@ -5,7 +5,6 @@ import { uploadCSV, findMaxBatchSize, listServerFiles, useServerFile, type Serve
 import type { Node } from '@xyflow/react';
 
 export function ConfigPanel() {
-  const config = useConfigStore();
   const selectedId = useGraphStore((s) => s.selectedNodeId);
   const nodes = useGraphStore((s) => s.nodes);
   const updateParam = useGraphStore((s) => s.updateNodeParam);
@@ -35,6 +34,7 @@ function DataSection() {
   const config = useConfigStore();
   const toSchema = useGraphStore((s) => s.toGraphSchema);
   const optimizer = useConfigStore((s) => s.optimizer);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState('');
   const [filename, setFilename] = useState('');
@@ -45,29 +45,6 @@ function DataSection() {
   useEffect(() => {
     listServerFiles().then(setServerFiles).catch(() => {});
   }, []);
-
-  const handleUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setUploading(true);
-    setUploadError('');
-    try {
-      const res = await uploadCSV(file);
-      config.setField('file_id', res.file_id);
-      // Only clear columns if they weren't pre-set (e.g. from a loaded graph config).
-      // Glob patterns like "s_*_g" are resolved by the backend.
-      if (!config.input_columns) config.setField('input_columns', '');
-      if (!config.target_columns) config.setField('target_columns', '');
-      config.setAvailableColumns(res.columns);
-      config.setNumRows(res.rows);
-      setFilename(res.filename);
-    } catch (err: any) {
-      const detail = err?.response?.data?.detail || err?.message || 'Upload failed';
-      setUploadError(detail);
-    } finally {
-      setUploading(false);
-    }
-  }, [config]);
 
   const selectedInputSpecs = config.input_columns.split(',').filter(Boolean);
   const selectedTargetSpecs = config.target_columns.split(',').filter(Boolean);
@@ -111,43 +88,72 @@ function DataSection() {
       <div style={sectionBodyStyle}>
         <label style={labelStyle}>Data File</label>
         <input
+          ref={fileInputRef}
           type="file"
           accept=".csv,.pt"
-          onChange={handleUpload}
-          style={{ fontSize: 10, color: '#ccc', width: '100%', marginBottom: 4 }}
+          onChange={async (e: React.ChangeEvent<HTMLInputElement>) => {
+            const file = e.target.files?.[0];
+            if (!file) return;
+            setUploading(true);
+            setUploadError('');
+            try {
+              const res = await uploadCSV(file);
+              config.setField('file_id', res.file_id);
+              if (!config.input_columns) config.setField('input_columns', '');
+              if (!config.target_columns) config.setField('target_columns', '');
+              config.setAvailableColumns(res.columns);
+              config.setNumRows(res.rows);
+              setFilename(res.filename);
+            } catch (err: any) {
+              setUploadError(err?.response?.data?.detail || err?.message || 'Upload failed');
+            } finally {
+              setUploading(false);
+            }
+          }}
+          style={{ display: 'none' }}
         />
-        {serverFiles.length > 0 && (
-          <select
-            value=""
-            onChange={async (e) => {
-              const fid = e.target.value;
-              if (!fid) return;
-              setUploading(true);
-              setUploadError('');
-              try {
-                const res = await useServerFile(fid);
-                config.setField('file_id', res.file_id);
-                if (!config.input_columns) config.setField('input_columns', '');
-                if (!config.target_columns) config.setField('target_columns', '');
-                config.setAvailableColumns(res.columns);
-                config.setNumRows(res.rows);
-                setFilename(res.filename);
-              } catch (err: any) {
-                setUploadError(err?.response?.data?.detail || err?.message || 'Failed');
-              } finally {
-                setUploading(false);
-              }
-            }}
-            style={{ ...inputStyle, fontSize: 10, marginBottom: 4 }}
-          >
-            <option value="">Server files...</option>
-            {serverFiles.map((f) => (
-              <option key={f.file_id} value={f.file_id}>
-                {f.filename} ({f.size_mb} MB)
-              </option>
-            ))}
-          </select>
-        )}
+        <select
+          value=""
+          onChange={(e) => {
+            if (e.target.value === '__upload__') {
+              fileInputRef.current?.click();
+            }
+          }}
+          style={{ ...inputStyle, fontSize: 10, marginBottom: 4 }}
+        >
+          <option value="">Local file...</option>
+          <option value="__upload__">Upload from computer</option>
+        </select>
+        <select
+          value={config.file_id || ''}
+          onChange={async (e) => {
+            const fid = e.target.value;
+            if (!fid) return;
+            setUploading(true);
+            setUploadError('');
+            try {
+              const res = await useServerFile(fid);
+              config.setField('file_id', res.file_id);
+              if (!config.input_columns) config.setField('input_columns', '');
+              if (!config.target_columns) config.setField('target_columns', '');
+              config.setAvailableColumns(res.columns);
+              config.setNumRows(res.rows);
+              setFilename(res.filename);
+            } catch (err: any) {
+              setUploadError(err?.response?.data?.detail || err?.message || 'Failed');
+            } finally {
+              setUploading(false);
+            }
+          }}
+          style={{ ...inputStyle, fontSize: 10, marginBottom: 4 }}
+        >
+          <option value="">Server file...</option>
+          {serverFiles.map((f) => (
+            <option key={f.file_id} value={f.file_id}>
+              {f.filename} ({(f.size_mb / 1024).toFixed(1)} GB)
+            </option>
+          ))}
+        </select>
         {uploading && <div style={{ color: '#22c55e', fontSize: 10 }}>Loading...</div>}
         {uploadError && <div style={{ color: '#ef4444', fontSize: 10, marginBottom: 4 }}>{uploadError}</div>}
         {filename && <div style={{ color: '#808090', fontSize: 10, marginBottom: 4 }}>{filename}</div>}
@@ -304,6 +310,17 @@ function TrainingSection() {
           <option value="Adam">Adam</option>
           <option value="SGD">SGD</option>
           <option value="AdamW">AdamW</option>
+        </select>
+
+        <label style={labelStyle}>LR Scheduler</label>
+        <select
+          value={config.scheduler}
+          onChange={(e) => config.setField('scheduler', e.target.value)}
+          style={inputStyle}
+        >
+          <option value="None">None</option>
+          <option value="CosineAnnealing">Cosine Annealing</option>
+          <option value="ReduceOnPlateau">Reduce on Plateau</option>
         </select>
 
         <div style={{ display: 'flex', gap: 8, marginBottom: 4 }}>
