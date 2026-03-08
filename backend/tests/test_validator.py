@@ -114,6 +114,40 @@ class TestRequiredInputs:
         assert any("required input" in e.lower() and "model" in e.lower() for e in errors)
 
 
+class TestEdgeDeletion:
+    """Verify validation behavior when edges are removed (simulating UI edge deletion)."""
+
+    def test_deleted_edge_cross_attention_missing_context(self):
+        """Removing input_context edge from CrossAttention should fail validation."""
+        graph = Graph(
+            nodes={
+                "embed": NodeInstance(id="embed", node_type="Linear", params={"out_features": 64}),
+                "trunk": NodeInstance(id="trunk", node_type="Linear", params={"out_features": 64}),
+                "cross": NodeInstance(id="cross", node_type="CrossAttention", params={"num_heads": 4}),
+            },
+            edges=[
+                Edge(id="e1", source_node="embed", source_output=0,
+                     target_node="cross", target_input="input_query"),
+                # input_context edge deleted — not present
+            ],
+        )
+        errors = validate_graph(graph)
+        assert any("required input" in e.lower() and "input_context" in e.lower() for e in errors)
+
+    def test_deleted_edge_still_valid_standalone_nodes(self):
+        """Removing an edge leaving two standalone nodes should still validate."""
+        graph = Graph(
+            nodes={
+                "a": NodeInstance(id="a", node_type="ReLU"),
+                "b": NodeInstance(id="b", node_type="ReLU"),
+            },
+            edges=[],  # Edge between a→b deleted
+        )
+        errors = validate_graph(graph)
+        assert not any("cycle" in e.lower() for e in errors)
+        assert not any("required input" in e.lower() for e in errors)
+
+
 class TestValidationWithDisabledNodes:
     def test_disabled_node_still_validates(self, simple_layer_graph):
         """Disabled nodes pass validation — disabled is execution-time, not validation-time."""

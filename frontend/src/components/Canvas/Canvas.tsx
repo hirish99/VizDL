@@ -110,6 +110,7 @@ export function Canvas() {
         defaultEdgeOptions={{
           type: 'smoothstep',
           style: { stroke: '#4a4a6a', strokeWidth: 2 },
+          interactionWidth: 20,
         }}
       >
         <Background color="#2a2a3e" gap={20} />

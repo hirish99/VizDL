@@ -27,3 +27,9 @@ html, body, #root {
 ::-webkit-scrollbar-thumb:hover {
   background: #3a3a4e;
 }
+
+/* Selected edge highlight — click edge then press Delete to remove */
+.react-flow__edge.selected .react-flow__edge-path {
+  stroke: #ef4444;
+  stroke-width: 3;
+}
